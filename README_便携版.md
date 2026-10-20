@@ -56,6 +56,8 @@
 
 GUI 要求输入本机获授权的 HTTPS origin 和对应验证 key；验证 key 仅以 DPAPI 保护形式保存。按钮会在注册后使用独立设备 SSH 反向隧道，并实际执行公网 MCP `initialize`、`tools/list` 和默认工作区无害 `tree` 只读调用；只有这些步骤全部成功才显示地址。没有服务器、origin、验证 key、隧道或公网路由时，界面会报告具体失败，不会显示虚假的成功地址。`--provision` 使用同一套门禁；`--status`/`--start`/`--stop` 仍可单独管理生命周期。
 
+勾选“开机自动启动（登录后后台运行）”后，当前 Windows 用户登录时会静默启动客户端，并在已有 origin 和独立设备配置时自动恢复本机 MCP；不会在每次登录时重复注册设备。窗口右上角 `X` 只会隐藏到任务栏通知区域；托盘右键“退出并停止本地 MCP”会停止独立 KT 和 SSH 隧道。开机自启只写入当前用户的 HKCU Run 项，不保存 token、私钥或 endpoint secret。
+
 ## 命令行
 
 ```powershell

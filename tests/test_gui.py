@@ -175,6 +175,47 @@ def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_pa
     assert value.request_button.states == ["disabled", "normal"]
 
 
+def test_logon_resume_starts_saved_services_without_reregistering(monkeypatch, tmp_path):
+    value = _gui_without_tk()
+    value.config_path = str(tmp_path)
+    value._service_lock = threading.Lock()
+    value._shutdown_requested = False
+    value._supervisor = None
+    value._runtime = None
+    value._tunnel = None
+    Path(tmp_path, "profile.json").write_text("{}", encoding="utf-8")
+    endpoint = "https://device.example.invalid/mcp/" + ("Q" * 43)
+    calls: list[str] = []
+
+    monkeypatch.setattr(gui, "config_file", lambda path: Path(path) / "profile.json")
+    monkeypatch.setattr(gui, "load", lambda path: type("Profile", (), {
+        "public_origin": "https://device.example.invalid",
+    })())
+
+    class FakeRuntime:
+        def url(self):
+            calls.append("url")
+            return endpoint
+
+    class FakeSupervisor:
+        def __init__(self, profile, runtime_root):
+            self.runtime = FakeRuntime()
+            self.tunnel = object()
+
+        def start(self):
+            calls.append("start")
+            return type("Status", (), {"state": "running", "detail": ""})()
+
+        def stop(self):
+            calls.append("stop")
+
+    monkeypatch.setattr(gui, "Supervisor", FakeSupervisor)
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda value, profile: calls.append("verify"))
+
+    assert value._resume_saved_services() == endpoint
+    assert calls == ["start", "url", "verify"]
+
+
 def test_missing_runtime_configuration_is_clear_and_does_not_provision(monkeypatch, tmp_path):
     value = _gui_without_tk()
     value.config_path = str(tmp_path)

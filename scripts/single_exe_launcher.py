@@ -241,6 +241,9 @@ def _launch(root: Path, *, wait: bool = False) -> int:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # Let the extracted client register the outer one-file EXE for
+        # Windows logon startup instead of bypassing the payload launcher.
+        env={**os.environ, "KT_MCP_LAUNCHER_EXE": str(Path(sys.executable).resolve())},
         creationflags=flags,
         close_fds=True,
     )

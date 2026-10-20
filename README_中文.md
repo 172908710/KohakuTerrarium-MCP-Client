@@ -24,9 +24,10 @@
 - 可编辑的 HTTPS origin；每台电脑必须输入自己获授权的公网 origin 和对应验证 key；源码不内置真实域名；
 - “启动并获取地址”按钮；
 - 只读的完整返回 URL；
+- “开机自动启动（登录后后台运行）”开关；
 - 状态提示。
 
-窗口不包含 profile、workspace、KT Python、SSH 或端口编辑项；用户只输入 origin 和验证 key，key 会以 DPAPI 保护保存。按钮在后台线程中按 **独立 KT setup → start → url → provisioning → SSH 隧道 → 公网验证** 的顺序执行：完整 `endpoint_url` 只来自本机独立 KT 的 `url` 命令，随后才向独立 provisioning API 注册。它不会启动或停止生产 runtime，也不会复制生产 secret。origin 是用户输入；如果 KT 返回的 endpoint origin 与它不一致，流程会 fail closed。
+窗口不包含 profile、workspace、KT Python、SSH 或端口编辑项；用户只输入 origin 和验证 key，key 会以 DPAPI 保护保存。勾选开机自启后，Windows 登录时会静默启动并自动恢复本机配置。点击窗口右上角 `X` 会隐藏到任务栏通知区域，不会停止本地 MCP；右键托盘图标并选择“退出并停止本地 MCP”才会停止独立 KT 和 SSH 隧道。按钮在后台线程中按 **独立 KT setup → start → url → provisioning → SSH 隧道 → 公网验证** 的顺序执行：完整 `endpoint_url` 只来自本机独立 KT 的 `url` 命令，随后才向独立 provisioning API 注册。它不会启动或停止生产 runtime，也不会复制生产 secret。origin 是用户输入；如果 KT 返回的 endpoint origin 与它不一致，流程会 fail closed。
 
 按钮需要**单独的服务端/VPS provisioning API**。客户端向 `KT_MCP_PROVISION_URL` 指定的 HTTPS API 发送 JSON POST；未设置该环境变量时，默认 origin 使用 `/provision`。请求包含 origin、保存在独立配置根中的非 secret `installation_id`，以及本机独立 KT 已产生的完整 `endpoint_url`。服务端只接受该 URL 中的 secret 作为唯一来源，不生成或替换 secret；服务端返回的 `url`/`endpoint_url` 必须与本机 endpoint 完全一致，并可附带 `remote_port`。注册 token 可在配置阶段写入 `profile.json` 的 Windows DPAPI 保护字段，双击重启后仍可使用；它不会进入通用便携包或子进程环境。API 本身不会建立隧道。
 

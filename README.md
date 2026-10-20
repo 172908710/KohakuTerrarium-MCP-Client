@@ -28,6 +28,12 @@ On a clean computer, first-run initialization discovers that computer's
 available drive roots and stores them in its own profile. Existing profiles
 are not overwritten. The GUI does not display the local directory list.
 
+Enable `开机自动启动（登录后后台运行）` in the GUI when this device should
+resume silently after Windows logon. Closing the window moves the client to the
+notification area; choose `退出并停止本地 MCP` from the tray menu to stop the
+independent KT process and SSH tunnel. This setting is per Windows user and
+does not put credentials in the registry.
+
 See [`README_中文.md`](README_中文.md) for the Chinese guide and
 [`README_便携版.md`](README_便携版.md) for the portable distribution guide.
 

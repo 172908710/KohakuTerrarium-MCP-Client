@@ -25,6 +25,11 @@ def _parser() -> argparse.ArgumentParser:
     group.add_argument("--provision", action="store_true", help="启动独立 KT 并注册其实际 endpoint URL")
     group.add_argument("--stop", action="store_true", help="停止 SSH 和 KT")
     group.add_argument("--url", action="store_true", help="读取并输出独立 KT 的实际 MCP 地址（敏感信息）")
+    parser.add_argument(
+        "--startup",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--config", help="配置目录或 profile.json 路径")
     return parser
 
@@ -114,7 +119,7 @@ def _provision(args: argparse.Namespace, profile, config_root) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not any((args.status, args.start, args.provision, args.stop, args.url)):
-        run_gui(args.config)
+        run_gui(args.config, startup_mode=args.startup)
         return 0
     try:
         profile = load(args.config)
