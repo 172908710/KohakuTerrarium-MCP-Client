@@ -1,0 +1,3 @@
+# Build dependency. The portable ZIP already includes this and all dependencies.
+# Use requirements-runtime.lock.txt to reproduce the verified Windows x64 snapshot.
+kohakuterrarium==2.1.5

@@ -1,0 +1,2 @@
+# Optional build-only dependency for the single-file Windows launcher.
+pyinstaller==6.22.0

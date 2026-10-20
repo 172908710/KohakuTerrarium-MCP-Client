@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+server/.env
+server/.env.*
+!server/.env.example
+server/registry.sqlite3
+server/routes.map
+server/backups/
+
+# Generated portable binaries and per-device state (included only by the release builder as appropriate).
+.venv/
+runtime/
+tools/
+dist/
+data/
+workspace/
+.runtime-build-*/
+.portable-smoke*/
+.single-exe-build/
+*.exe
+*.exe.sha256
+/*-test-output.txt
+/pytest-server.log
+dist/*-verification.json
+dist/startup-performance.json

@@ -1,0 +1,21 @@
+[Unit]
+Description=KT independent MCP provisioning API (not the production MCP bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kt-mcp-provision
+Group=kt-mcp-provision
+WorkingDirectory=/opt/kt-mcp-provision
+EnvironmentFile=/etc/kt-mcp-provision/provision.env
+ExecStart=/usr/bin/python3 -m server.service
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/kt-mcp-provision
+
+[Install]
+WantedBy=multi-user.target
