@@ -163,3 +163,61 @@ def test_archive_excludes_user_data_and_real_env(tmp_path):
         path.write_text("fixture", encoding="utf-8")
     files = {p.relative_to(tmp_path).as_posix() for p in module.distribution_files(tmp_path)}
     assert files == {"server/.env.example", "src/app.py", "launch.py"}
+
+
+def test_gui_instance_is_claimed_before_portable_initialization(bundle, monkeypatch):
+    calls = []
+
+    class FakeInstance:
+        def __init__(self, path):
+            calls.append(("instance", Path(path)))
+
+        def acquire(self, *, activate_existing):
+            calls.append(("acquire", activate_existing))
+            return True
+
+        def close(self):
+            calls.append(("close",))
+
+    profile = bundle / "data" / "profile.json"
+    monkeypatch.setattr("kt_mcp_client.instance.GUIInstance", FakeInstance)
+    monkeypatch.setattr(portable, "prepare_environment", lambda root: calls.append(("prepare", root)))
+    monkeypatch.setattr(portable, "initialize", lambda root, requested=None: calls.append(("initialize", root)) or profile)
+    monkeypatch.setattr("kt_mcp_client.__main__.main", lambda argv, **kwargs: calls.append(("client", argv, kwargs)) or 0)
+
+    assert portable.main([], root=bundle) == 0
+    assert [item[0] for item in calls] == ["instance", "acquire", "prepare", "initialize", "client", "close"]
+    assert calls[1] == ("acquire", True)
+
+
+def test_secondary_gui_exits_before_initialization(bundle, monkeypatch):
+    calls = []
+
+    class FakeInstance:
+        def __init__(self, path):
+            calls.append("instance")
+
+        def acquire(self, *, activate_existing):
+            calls.append(("acquire", activate_existing))
+            return False
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr("kt_mcp_client.instance.GUIInstance", FakeInstance)
+    monkeypatch.setattr(portable, "prepare_environment", lambda root: calls.append("prepare"))
+    monkeypatch.setattr(portable, "initialize", lambda *args: pytest.fail("secondary must not initialize"))
+
+    assert portable.main([], root=bundle) == 0
+    assert calls == ["instance", ("acquire", True), "close"]
+
+
+def test_portable_cli_does_not_claim_gui_instance(bundle, monkeypatch):
+    calls = []
+    monkeypatch.setattr(portable, "prepare_environment", lambda root: calls.append("prepare"))
+    monkeypatch.setattr(portable, "initialize", lambda root, requested=None: calls.append("initialize") or bundle / "data/profile.json")
+    monkeypatch.setattr("kt_mcp_client.instance.GUIInstance", lambda *args, **kwargs: pytest.fail("CLI must bypass GUI lock"))
+    monkeypatch.setattr("kt_mcp_client.__main__.main", lambda argv, **kwargs: calls.append(("client", argv)) or 0)
+
+    assert portable.main(["--status"], root=bundle) == 0
+    assert calls == ["prepare", "initialize", ("client", ["--config", str(bundle / "data/profile.json"), "--status"])]

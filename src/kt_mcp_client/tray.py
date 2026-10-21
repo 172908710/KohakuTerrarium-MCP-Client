@@ -9,6 +9,7 @@ non-Windows builds simply report that no tray is available.
 from __future__ import annotations
 
 import os
+import queue
 from typing import Callable
 
 
@@ -46,6 +47,7 @@ class TrayController:
         self._hicon: int | None = None
         self._nid: tuple | None = None
         self._class_name = "KohakuTerrariumMCPTray"
+        self._actions: queue.SimpleQueue[str] = queue.SimpleQueue()
 
     def start(self) -> bool:
         """Create the icon and begin polling tray messages from Tk."""
@@ -149,6 +151,16 @@ class TrayController:
         except Exception:
             self._pump_id = None
 
+    def set_tooltip(self, text: str) -> None:
+        self.tooltip = text[:127]
+        if not self.available or self._win32 is None or self._nid is None:
+            return
+        self._nid = (*self._nid[:5], self.tooltip)
+        try:
+            self._win32.Shell_NotifyIcon(self._win32.NIM_MODIFY, self._nid)
+        except Exception:
+            pass
+
     def pump(self) -> None:
         """Process queued Shell_NotifyIcon messages without blocking Tk."""
 
@@ -162,6 +174,17 @@ class TrayController:
             # next TaskbarCreated message will re-add it; a transient error
             # should not take down the MCP process.
             pass
+        # Tk may dispatch our Win32 window procedure from inside Tcl. Never
+        # re-enter Tk there; deliver actions only after returning to this poll.
+        while not self._stopped:
+            try:
+                action = self._actions.get_nowait()
+            except queue.Empty:
+                break
+            if action == "show":
+                self.on_show()
+            elif action == "exit":
+                self.on_exit()
         self._schedule_pump()
 
     def _on_taskbar_restart(self, *_args: object) -> None:
@@ -183,7 +206,7 @@ class TrayController:
     def _on_taskbar_notify(self, _hwnd: int, _msg: int, _wparam: int, lparam: int) -> int:
         assert self._win32con is not None
         if lparam in (self._win32con.WM_LBUTTONUP, self._win32con.WM_LBUTTONDBLCLK):
-            self.on_show()
+            self._actions.put("show")
         elif lparam == self._win32con.WM_RBUTTONUP:
             self._show_menu()
         return 1
@@ -223,9 +246,9 @@ class TrayController:
         assert self._win32api is not None
         command = self._win32api.LOWORD(wparam)
         if command == self._SHOW_ID:
-            self.on_show()
+            self._actions.put("show")
         elif command == self._EXIT_ID:
-            self.on_exit()
+            self._actions.put("exit")
         return 0
 
     def stop(self) -> None:

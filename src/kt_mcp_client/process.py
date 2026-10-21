@@ -13,6 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+try:
+    import psutil
+except ImportError:  # Source-only environments may omit the bundled dependency.
+    psutil = None
+
 
 PROVISION_TOKEN_ENV = "KT_MCP_PROVISION_TOKEN"
 STUDIO_CONTROL_CONFIG_ENV = "KT_STUDIO_CONTROL_CONFIG"
@@ -98,6 +103,16 @@ def _read_proc_cmdline(pid: int) -> str | None:
             return proc_file.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
         except OSError:
             return None
+
+    if psutil is not None:
+        try:
+            arguments = psutil.Process(pid).cmdline()
+            return subprocess.list2cmdline(arguments) if arguments else None
+        except psutil.NoSuchProcess:
+            # An exited PID needs no expensive PowerShell/WMIC retry.
+            return None
+        except (psutil.AccessDenied, NotImplementedError, OSError):
+            pass
 
     # WMIC is removed from newer Windows releases.  Prefer CIM through a
     # no-profile, non-interactive PowerShell process, then use WMIC as a

@@ -122,7 +122,7 @@ class Supervisor:
         self._detail = detail if isinstance(detail, str) else str(detail)
         self._fresh_state = False
 
-    def _write_state(self) -> None:
+    def _write_state(self, snapshot: SupervisorStatus | None = None) -> None:
         # A fresh health probe is intentionally ephemeral.  Only an explicit
         # lifecycle command establishes a persisted ownership marker.
         if self._fresh_state:
@@ -133,7 +133,7 @@ class Supervisor:
             return
         self._writing_state = True
         try:
-            payload = self.status().public_dict()
+            payload = (snapshot if snapshot is not None else self.status()).public_dict()
             path = self.state_dir / "status.json"
             temporary = path.with_name("." + path.name + ".tmp")
             try:
@@ -468,19 +468,34 @@ class Supervisor:
                 thread.join(timeout=2)
             self._reconnect_thread = None
             tunnel_detail = ""
+            runtime_status = None
             try:
                 tunnel_status = self.tunnel.stop()
                 tunnel_detail = tunnel_status.detail
             finally:
                 try:
-                    self.runtime.stop()
+                    runtime_status = self.runtime.stop()
                 except KTRuntimeError as exc:
                     if not tunnel_detail:
                         tunnel_detail = str(exc)
             self._state = "stopped"
             self._detail = self._safe_detail(tunnel_detail)
-            self._write_state()
-            return self.status()
+            # Both stop methods already return post-stop observations. Reuse
+            # them instead of launching additional KT status subprocesses.
+            if runtime_status is not None:
+                snapshot = SupervisorStatus(
+                    self._state,
+                    public_dict(self.profile),
+                    self._runtime_dict(runtime_status),
+                    self._tunnel_dict(tunnel_status),
+                    self._detail,
+                )
+            else:
+                # A failed KT stop has no returned observation; retain the
+                # existing failure contract with one explicit health probe.
+                snapshot = self.status()
+            self._write_state(snapshot)
+            return snapshot
 
     def restart(self) -> SupervisorStatus:
         self.stop()

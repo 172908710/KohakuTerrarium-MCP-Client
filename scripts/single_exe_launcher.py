@@ -9,6 +9,7 @@ DPAPI-protected profile, SSH key and verified endpoint remain unchanged.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 
@@ -115,6 +117,59 @@ def _is_complete_install(target: Path, digest: str) -> bool:
     )
 
 
+@contextmanager
+def _payload_install_lock(target: Path):
+    """Serialize payload extraction without a stale PID marker.
+
+    The lock is a one-byte OS file-range lock. Windows releases ``msvcrt``
+    locks automatically when the owning process exits, including crashes;
+    POSIX ``flock`` provides the same property for source-level tests. The
+    lock file is kept beside the cache, never inside the extracted payload.
+    """
+
+    target = target.resolve(strict=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f".{target.name}.install.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    fd = os.open(str(lock_path), flags, 0o600)
+    handle = os.fdopen(fd, "r+b", buffering=0)
+    try:
+        # Ensure the one-byte range exists before asking the CRT to lock it.
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:  # pragma: no cover - exercised only by source-level Unix runs
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - exercised only by source-level Unix runs
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        handle.close()
+
+
 def _write_marker(path: Path, digest: str) -> None:
     """Atomically publish a complete payload marker."""
 
@@ -157,44 +212,51 @@ def _install_payload() -> Path:
     if _is_complete_install(target, digest):
         return target
 
-    # Never replace a live cached installation.  A fresh executable can be
-    # retried after the previous client has been stopped.  The data directory
-    # is intentionally retained; this message explains why an update is held.
-    if (target / "data" / "profile.json").is_file():
-        raise RuntimeError(
-            "单 EXE 缓存版本已变化或不完整；为保护现有 data/凭据，未覆盖缓存。"
-            f"请先关闭客户端并处理缓存：{target}"
-        )
-
     target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(
-        tempfile.mkdtemp(prefix="kt-single-exe-", dir=str(target.parent))
-    )
-    try:
-        source = _safe_extract(payload, stage)
-        target.mkdir(parents=True, exist_ok=True)
-        for item in source.iterdir():
-            destination = target / item.name
-            if item.name.casefold() in {"data", "workspace"}:
-                continue
-            if item.is_dir():
-                shutil.copytree(item, destination, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, destination)
-        # The marker is published only after all required files are present.
-        if not all(
-            path.is_file()
-            for path in (
-                target / "launch.py",
-                target / "runtime" / "pythonw.exe",
-                target / "runtime" / "python.exe",
+    with _payload_install_lock(target):
+        # Re-check after acquiring the lock: another launcher may have
+        # completed extraction while this process was waiting.
+        if _is_complete_install(target, digest):
+            return target
+
+        # Never replace a live cached installation.  A fresh executable can be
+        # retried after the previous client has been stopped.  The data
+        # directory is intentionally retained; this message explains why an
+        # update is held.
+        if (target / "data" / "profile.json").is_file():
+            raise RuntimeError(
+                "单 EXE 缓存版本已变化或不完整；为保护现有 data/凭据，未覆盖缓存。"
+                f"请先关闭客户端并处理缓存：{target}"
             )
-        ):
-            raise RuntimeError("portable payload extraction is incomplete")
-        _write_marker(marker, digest)
-        return target
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
+
+        stage = Path(
+            tempfile.mkdtemp(prefix="kt-single-exe-", dir=str(target.parent))
+        )
+        try:
+            source = _safe_extract(payload, stage)
+            target.mkdir(parents=True, exist_ok=True)
+            for item in source.iterdir():
+                destination = target / item.name
+                if item.name.casefold() in {"data", "workspace"}:
+                    continue
+                if item.is_dir():
+                    shutil.copytree(item, destination, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, destination)
+            # The marker is published only after all required files are present.
+            if not all(
+                path.is_file()
+                for path in (
+                    target / "launch.py",
+                    target / "runtime" / "pythonw.exe",
+                    target / "runtime" / "python.exe",
+                )
+            ):
+                raise RuntimeError("portable payload extraction is incomplete")
+            _write_marker(marker, digest)
+            return target
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def _redact(text: object) -> str:

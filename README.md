@@ -23,6 +23,16 @@ keeps the endpoint flow compact: local KT setup, provisioning, SSH tunnel, and
 actual public MCP verification before showing an address. Each device must
 enter its authorized HTTPS origin and matching verification key; the key is
 stored only in the local DPAPI-protected profile.
+The origin and verification-key fields always start empty, including on an
+already configured device. Silent startup reads the local profile directly;
+saved settings are not copied into the form.
+Use the origin's paste button and the verified MCP address's copy button for
+clipboard access. Tray exit stops services in a background worker, keeps the
+interface responsive, and closes only after shutdown is confirmed.
+The startup checkbox, status, and elapsed time are aligned in the upper-right
+of the compact window. One GUI instance is allowed per configuration directory;
+launching it again brings the existing window forward instead of starting a
+second local MCP. Separate configuration directories remain independent.
 
 On a clean computer, first-run initialization discovers that computer's
 available drive roots and stores them in its own profile. Existing profiles

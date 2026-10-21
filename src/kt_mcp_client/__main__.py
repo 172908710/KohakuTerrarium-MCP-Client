@@ -6,6 +6,7 @@ import sys
 
 from .config import ConfigError, config_file, load
 from .gui import run_gui
+from .instance import GUIInstance, InstanceError
 from .kt_runtime import KTRuntime, KTRuntimeError
 from .provisioning import (
     ProvisioningError,
@@ -116,11 +117,29 @@ def _provision(args: argparse.Namespace, profile, config_root) -> str:
     return endpoint_url
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, gui_instance: GUIInstance | None = None) -> int:
     args = _parser().parse_args(argv)
     if not any((args.status, args.start, args.provision, args.stop, args.url)):
-        run_gui(args.config, startup_mode=args.startup)
-        return 0
+        owned_instance = False
+        if gui_instance is None:
+            try:
+                gui_instance = GUIInstance(config_file(args.config))
+                if not gui_instance.acquire(activate_existing=not args.startup):
+                    gui_instance.close()
+                    return 0
+                owned_instance = True
+            except (InstanceError, ConfigError) as exc:
+                print(f"错误：{exc}", file=sys.stderr)
+                return 2
+        try:
+            run_kwargs = {"startup_mode": args.startup}
+            if gui_instance is not None:
+                run_kwargs["instance"] = gui_instance
+            run_gui(args.config, **run_kwargs)
+            return 0
+        finally:
+            if owned_instance and gui_instance is not None:
+                gui_instance.close()
     try:
         profile = load(args.config)
         config_root = config_file(args.config).parent

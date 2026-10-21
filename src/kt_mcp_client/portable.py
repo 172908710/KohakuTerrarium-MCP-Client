@@ -227,21 +227,41 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
     parser.add_argument("--config")
     options, forwarded = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
     root = (root or Path(__file__).resolve().parents[2]).resolve()
+
+    # Claim the GUI lifecycle before runtime probing or profile initialization.
+    # A second normal launch only signals the existing window; logon startup
+    # stays silent when an instance is already running. CLI lifecycle commands
+    # intentionally bypass this guard so status/stop remain usable.
+    gui_instance = None
+    lifecycle_flags = {"--status", "--start", "--provision", "--stop", "--url"}
+    gui_mode = not options.check and not any(flag in lifecycle_flags for flag in forwarded)
+    if gui_mode:
+        from .instance import GUIInstance
+
+        config_hint = config_file(options.config if options.config is not None else root / "data")
+        gui_instance = GUIInstance(config_hint)
+        if not gui_instance.acquire(activate_existing="--startup" not in forwarded):
+            gui_instance.close()
+            return 0
     prepare_environment(root)
-    filename = initialize(root, options.config)
-    if options.check:
-        profile = load(filename)
-        print(json.dumps({
-            "bundle_root": str(root), "profile": str(filename),
-            "kt_python": profile.kt_python, "kt_version": importlib.metadata.version("kohakuterrarium"),
-            "workspace": profile.workspace_path, "kt_home": profile.kt_home,
-            "local_port": profile.local_port, "runtime_cli_supported": True,
-            "ssh_bundled": (root / "tools" / "openssh" / "ssh.exe").is_file(),
-            "provision_token_set": bool(
-                profile.provision_token or os.environ.get("KT_MCP_PROVISION_TOKEN", "").strip()
-            ),
-            "network_tested": False, "endpoint_started": False,
-        }, ensure_ascii=False, indent=2))
-        return 0
-    from .__main__ import main as client_main
-    return client_main(["--config", str(filename), *forwarded])
+    try:
+        filename = initialize(root, options.config)
+        if options.check:
+            profile = load(filename)
+            print(json.dumps({
+                "bundle_root": str(root), "profile": str(filename),
+                "kt_python": profile.kt_python, "kt_version": importlib.metadata.version("kohakuterrarium"),
+                "workspace": profile.workspace_path, "kt_home": profile.kt_home,
+                "local_port": profile.local_port, "runtime_cli_supported": True,
+                "ssh_bundled": (root / "tools" / "openssh" / "ssh.exe").is_file(),
+                "provision_token_set": bool(
+                    profile.provision_token or os.environ.get("KT_MCP_PROVISION_TOKEN", "").strip()
+                ),
+                "network_tested": False, "endpoint_started": False,
+            }, ensure_ascii=False, indent=2))
+            return 0
+        from .__main__ import main as client_main
+        return client_main(["--config", str(filename), *forwarded], gui_instance=gui_instance)
+    finally:
+        if gui_instance is not None:
+            gui_instance.close()

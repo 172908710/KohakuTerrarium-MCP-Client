@@ -1,12 +1,13 @@
 """Supervisor health-state tests."""
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import pytest
 import sys
 
 from kt_mcp_client.config import DeviceProfile
-from kt_mcp_client.kt_runtime import RuntimeStatus
+from kt_mcp_client.kt_runtime import KTRuntimeError, RuntimeStatus
 from kt_mcp_client.process import ProcessStatus
 from kt_mcp_client.ssh_tunnel import SSHTunnelError, TunnelStatus
 from kt_mcp_client.supervisor import Supervisor, SupervisorError
@@ -220,6 +221,105 @@ def test_explicit_stop_state_is_sticky_for_new_status_process(tmp_path):
         supervisor.profile, root, runtime=fresh_runtime, tunnel=fresh_tunnel, reconnect=False
     )
     assert reopened.status().state == "stopped"
+
+
+def test_stop_reuses_post_stop_snapshots_without_extra_probes(tmp_path, monkeypatch):
+    runtime = FakeRuntime(runtime_status(tmp_path, "ready"))
+    tunnel = FakeTunnel(healthy_tunnel())
+    root = tmp_path / "config" / "runtime"
+    supervisor = Supervisor(
+        profile(tmp_path), root, runtime=runtime, tunnel=tunnel, reconnect=False
+    )
+    stopped_runtime = RuntimeStatus(
+        ProcessStatus("kt-runtime", False, None, False, 0), "stopped", "", False
+    )
+    stopped_tunnel = TunnelStatus(
+        ProcessStatus("ssh-tunnel", False, None, False, 0), True
+    )
+    calls = []
+
+    def stop_tunnel():
+        calls.append("tunnel.stop")
+        assert supervisor._reconnect_stop.is_set()
+        return stopped_tunnel
+
+    def stop_runtime():
+        calls.append("runtime.stop")
+        return stopped_runtime
+
+    monkeypatch.setattr(tunnel, "stop", stop_tunnel)
+    monkeypatch.setattr(runtime, "stop", stop_runtime)
+    monkeypatch.setattr(tunnel, "status", lambda: pytest.fail("Extra tunnel health probe"))
+    monkeypatch.setattr(runtime, "status", lambda: pytest.fail("Extra KT status subprocess"))
+
+    result = supervisor.stop()
+
+    assert calls == ["tunnel.stop", "runtime.stop"]
+    assert result.state == "stopped"
+    assert result.runtime["cli_status"] == "stopped"
+    assert result.tunnel["process"]["running"] is False
+    assert json.loads((root / "state" / "status.json").read_text(encoding="utf-8")) == result.public_dict()
+
+
+def test_tunnel_stop_error_still_attempts_runtime_stop(tmp_path, monkeypatch):
+    runtime = FakeRuntime(runtime_status(tmp_path, "ready"))
+    tunnel = FakeTunnel(healthy_tunnel())
+    supervisor = Supervisor(
+        profile(tmp_path), tmp_path / "config" / "runtime",
+        runtime=runtime, tunnel=tunnel, reconnect=False,
+    )
+    calls = []
+
+    def stop_tunnel():
+        calls.append("tunnel.stop")
+        raise SSHTunnelError("identity check refused")
+
+    def stop_runtime():
+        calls.append("runtime.stop")
+        return runtime.status_value
+
+    monkeypatch.setattr(tunnel, "stop", stop_tunnel)
+    monkeypatch.setattr(runtime, "stop", stop_runtime)
+
+    with pytest.raises(SSHTunnelError, match="identity check refused"):
+        supervisor.stop()
+
+    assert calls == ["tunnel.stop", "runtime.stop"]
+    assert supervisor._reconnect_stop.is_set()
+
+
+def test_runtime_stop_error_probes_once_and_preserves_live_status(tmp_path, monkeypatch):
+    runtime = FakeRuntime(runtime_status(tmp_path, "ready"))
+    tunnel = FakeTunnel(TunnelStatus(ProcessStatus("ssh-tunnel", False, None, False, 0), True))
+    supervisor = Supervisor(
+        profile(tmp_path), tmp_path / "config" / "runtime",
+        runtime=runtime, tunnel=tunnel, reconnect=False,
+    )
+    calls = []
+
+    def stop_runtime():
+        calls.append("runtime.stop")
+        raise KTRuntimeError("stop timed out")
+
+    def runtime_probe():
+        calls.append("runtime.status")
+        return runtime.status_value
+
+    def tunnel_probe():
+        calls.append("tunnel.status")
+        return tunnel.status_value
+
+    monkeypatch.setattr(runtime, "stop", stop_runtime)
+    monkeypatch.setattr(runtime, "status", runtime_probe)
+    monkeypatch.setattr(tunnel, "status", tunnel_probe)
+
+    result = supervisor.stop()
+
+    assert calls == ["runtime.stop", "runtime.status", "tunnel.status"]
+    assert result.state == "stopped"
+    assert result.runtime["cli_status"] == "ready"
+    assert result.runtime["local_ready"] is True
+    assert result.detail == "stop timed out"
 
 
 def test_persisted_running_state_is_rechecked_by_new_status_process(tmp_path):
