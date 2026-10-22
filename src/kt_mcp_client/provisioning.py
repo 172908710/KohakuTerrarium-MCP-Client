@@ -773,6 +773,13 @@ def provision_and_save(
 
     if config_path is None:
         config_path = config
+    # A new computer needs SSH enrollment regardless of key prefix. Retain the
+    # legacy contract only for already configured, non-auto-enrolled devices.
+    # A failed v2 request never falls back to a route without SSH authorization.
+    from .enrollment import enroll_and_save, needs_automatic_enrollment
+    if _registration_token(profile).startswith("ktd_") or needs_automatic_enrollment(profile, config_path):
+        return enroll_and_save(origin, endpoint_url, profile=profile,
+                               config_path=config_path, opener=opener, timeout=timeout)
     provisioned = _request_provisioned_endpoint(
         origin, endpoint_url, profile=profile, config_path=config_path, opener=opener, timeout=timeout
     )

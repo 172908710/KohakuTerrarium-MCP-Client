@@ -1,0 +1,39 @@
+# Dedicated Linux device-tunnel listener. This is NOT /etc/ssh/sshd_config.
+# Review/install as /etc/ssh/sshd_config_kt_devices, root:root 0644.
+# Keep the administrator's port 22, firewall allowlist and production keys unchanged.
+Port 2222
+AddressFamily inet
+ListenAddress 0.0.0.0
+PidFile /run/kt-mcp-device-sshd.pid
+HostKey /etc/ssh/ssh_host_ed25519_key
+PermitRootLogin no
+AllowUsers kt-mcp-devices
+PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms ssh-ed25519
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM yes
+StrictModes yes
+AuthorizedKeysFile none
+AuthorizedKeysCommand /usr/bin/python3 -I /opt/kt-mcp-provision/server/authorized_keys.py --user %u --type %t --key %k
+AuthorizedKeysCommandUser kt-mcp-provision
+AllowTcpForwarding remote
+# The per-key permitlisten returned by the helper supplies the exact port.
+# Never add a broader key file or fallback public key to this listener.
+PermitOpen none
+AllowStreamLocalForwarding no
+GatewayPorts no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+PermitTunnel no
+PermitUserRC no
+MaxSessions 0
+MaxAuthTries 3
+LoginGraceTime 20
+ClientAliveInterval 30
+ClientAliveCountMax 3
+UseDNS no
+LogLevel ERROR

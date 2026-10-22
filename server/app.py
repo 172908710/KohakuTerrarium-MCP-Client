@@ -13,7 +13,7 @@ import hmac
 import ipaddress
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -29,6 +29,7 @@ from .registry import (
     RegistrySettings,
 )
 from .service import MAX_BODY_BYTES, RateLimiter
+from .enrollment import EnrollmentService, EnrollmentSettings, EnrollmentDenied, EnrollmentConflict
 
 
 class ProvisionRequest(BaseModel):
@@ -37,11 +38,15 @@ class ProvisionRequest(BaseModel):
     origin: str = Field(min_length=1, max_length=512)
     installation_id: str = Field(min_length=32, max_length=32)
     endpoint_url: str = Field(min_length=1, max_length=512)
+    enrollment_version: Literal[2] | None = None
+    ssh_public_key: str | None = Field(default=None, max_length=256)
 
 
 class ProvisionResponse(BaseModel):
     url: str
     remote_port: int
+    enrollment_version: int | None = None
+    ssh: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,7 @@ def create_app(
     *,
     security: AppSecurity | None = None,
     rate_limiter: RateLimiter | None = None,
+    enrollment: EnrollmentService | None = None,
 ) -> FastAPI:
     if registry is None:
         registry = AllocationRegistry(RegistrySettings.from_env())
@@ -75,6 +81,8 @@ def create_app(
     app.state.registry = registry
     app.state.security = security
     app.state.rate_limiter = rate_limiter
+    settings = EnrollmentSettings.from_env() if enrollment is None else None
+    app.state.enrollment = enrollment or (EnrollmentService(registry, settings) if settings else None)
 
     @app.middleware("http")
     async def enforce_provision_body_limit(request: Request, call_next: Any):
@@ -129,7 +137,7 @@ def create_app(
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/provision", response_model=ProvisionResponse)
+    @app.post("/provision", response_model=ProvisionResponse, response_model_exclude_none=True)
     def provision(
         payload: ProvisionRequest,
         request: Request,
@@ -137,6 +145,34 @@ def create_app(
     ) -> ProvisionResponse:
         if not app.state.rate_limiter.allow(client_key(request)):
             raise HTTPException(status_code=429, detail="too many provisioning requests")
+        device_request = payload.enrollment_version is not None or payload.ssh_public_key is not None
+        if device_request:
+            if payload.enrollment_version != 2 or payload.ssh_public_key is None:
+                raise HTTPException(status_code=400, detail="incomplete device enrollment request")
+            if app.state.enrollment is None:
+                raise HTTPException(status_code=503, detail="automatic device enrollment is not enabled")
+            try:
+                supplied = x_kt_provision_token or ""
+                if supplied.startswith("ktd_"):
+                    enrolled = app.state.enrollment.provision(
+                        supplied, payload.installation_id, payload.origin,
+                        payload.endpoint_url, payload.ssh_public_key,
+                    )
+                else:
+                    enrolled = app.state.enrollment.provision_shared(
+                        supplied, payload.installation_id, payload.origin,
+                        payload.endpoint_url, payload.ssh_public_key,
+                        expected_token=security.admin_token,
+                    )
+            except EnrollmentDenied as exc:
+                raise HTTPException(status_code=401, detail="invalid device activation key") from exc
+            except (EnrollmentConflict, EndpointConflict) as exc:
+                raise HTTPException(status_code=409, detail="device activation conflict") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="invalid device enrollment") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="device enrollment unavailable") from exc
+            return ProvisionResponse(**enrolled)
         security.check(x_kt_provision_token)
         try:
             allocation = registry.provision(

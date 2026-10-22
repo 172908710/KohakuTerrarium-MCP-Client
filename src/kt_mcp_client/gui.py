@@ -452,7 +452,10 @@ class ClientGUI:
                 if not str(getattr(profile, name, "") or "").strip()
             ]
             if missing_ssh:
-                raise SSHTunnelError("provisioning 已成功，但 SSH 凭据未配置：缺少 " + ", ".join(missing_ssh))
+                raise SSHTunnelError(
+                    "provisioning 已成功，但 SSH 凭据未配置：缺少 " + ", ".join(missing_ssh)
+                    + "。服务器未返回完整的自动接入配置；请升级服务端后重试，旧验证 key 无需更换，也不要复制管理员私钥。"
+                )
             validate_ssh_profile(profile)
             tunnel = SSHTunnel(profile, config_root / "runtime")
             if service_lock is None:

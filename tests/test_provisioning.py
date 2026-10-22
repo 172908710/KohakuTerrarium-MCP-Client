@@ -87,7 +87,15 @@ def test_response_size_limit_keeps_zero_argument_test_double_compatible():
 
 
 def verified_profile(tmp_path: Path, endpoint: str = ENDPOINT) -> DeviceProfile:
+    # These regressions exercise an already configured legacy device. Fresh
+    # shared-key device coverage belongs to test_shared_key_enrollment.py.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    identity, known = tmp_path / "legacy-test-key", tmp_path / "legacy-known-hosts"
+    identity.write_text("synthetic legacy key", encoding="ascii")
+    known.write_text("synthetic legacy pinned host", encoding="ascii")
     profile = DeviceProfile(
+        ssh_host="legacy.example.invalid", ssh_user="kt-mcp-device-01",
+        ssh_identity_file=str(identity), ssh_known_hosts=str(known),
         kt_home=str(tmp_path / "kt-home"),
         public_origin="https://device.example.invalid",
         secret="legacy-" + TOKEN,

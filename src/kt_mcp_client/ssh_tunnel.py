@@ -58,8 +58,17 @@ def _validate_port(value: object, label: str) -> str:
     return str(port)
 
 
+def _path_text(value: object, label: str) -> str:
+    # Paths are separate argv values, not shell fragments. Spaces/Unicode are
+    # valid on customer PCs; control characters and quotes are not accepted.
+    text = str(value or "").strip()
+    if not text or text.startswith("-") or any(ord(c) < 32 for c in text) or '"' in text:
+        raise SSHTunnelError(f"{label} 路径无效")
+    return text
+
+
 def _validate_file(value: object, label: str) -> str:
-    text = _required_text(value, label)
+    text = _path_text(value, label)
     path = Path(text).expanduser()
     if not path.is_file():
         raise SSHTunnelError(f"{label} 不存在或不是文件")
@@ -120,11 +129,14 @@ def build_reverse_command(profile: DeviceProfile, *, ssh_executable: str = "ssh"
     """Build argv for an SSH reverse tunnel without a shell or secret."""
 
     validate_ssh_profile(profile)
-    executable = _required_text(ssh_executable, "ssh executable")
-    if any(char.isspace() for char in executable):
-        raise SSHTunnelError("ssh executable 路径包含空白，请使用单独 argv")
+    executable = _path_text(ssh_executable, "ssh executable")
     identity = str(Path(profile.ssh_identity_file).expanduser())
     known_hosts = str(Path(profile.ssh_known_hosts).expanduser())
+    # OpenSSH parses -o with its config lexer, even with shell=False. Quote a
+    # spaced filename inside this one option, rather than splitting it into files.
+    known_hosts_option = known_hosts
+    if any(c.isspace() for c in known_hosts):
+        known_hosts_option = '"' + known_hosts.replace("\\", "/") + '"'
     remote = (
         f"{_validate_host(profile.remote_forward_host, 'remote_forward_host')}"
         f":{_validate_port(profile.remote_forward_port, 'remote_forward_port')}"
@@ -141,8 +153,14 @@ def build_reverse_command(profile: DeviceProfile, *, ssh_executable: str = "ssh"
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
         "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "IdentityAgent=none",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "PreferredAuthentications=publickey",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", "GlobalKnownHostsFile=none",
+        "-o", f"UserKnownHostsFile={known_hosts_option}",
     ]
     for option in normalise_extra_options(profile.ssh_extra_options):
         command.extend(["-o", option])

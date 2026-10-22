@@ -1,0 +1,14 @@
+[Unit]
+Description=KT customer device tunnels (separate from administrator SSH)
+After=network-online.target kt-mcp-provision.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/sshd_config_kt_devices
+ExecStart=/usr/sbin/sshd -D -e -f /etc/ssh/sshd_config_kt_devices
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

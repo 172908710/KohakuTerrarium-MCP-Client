@@ -459,7 +459,10 @@ class AllocationRegistry:
                 raise
             raise RegistryError("Nginx route synchronization failed") from exc
 
-    def provision(self, installation_id: str, origin: str, endpoint_url: str) -> Allocation:
+    def provision(
+        self, installation_id: str, origin: str, endpoint_url: str, *,
+        enrollment_gate: Callable[[sqlite3.Connection, Allocation], None] | None = None,
+    ) -> Allocation:
         installation = self._validate_installation_id(installation_id)
         requested_origin = normalize_origin(origin)
         endpoint_origin, requested_secret = parse_endpoint_url(endpoint_url)
@@ -506,6 +509,10 @@ class AllocationRegistry:
                         (installation,),
                     ).fetchone()
                 allocation = self._row_to_allocation(row)
+                # Automatic-device authorization is committed with its route.
+                # Any failed authorization or proxy reload rolls both back.
+                if enrollment_gate is not None:
+                    enrollment_gate(connection, allocation)
                 try:
                     self._sync_routes(connection)
                     # Keep the IMMEDIATE transaction open while rendering and

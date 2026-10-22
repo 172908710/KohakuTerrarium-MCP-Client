@@ -27,6 +27,8 @@ from .registry import (
     RegistrySettings,
 )
 
+from .enrollment import EnrollmentService, EnrollmentSettings, EnrollmentDenied, EnrollmentConflict
+
 MAX_BODY_BYTES = 4096
 RATE_LIMIT_COUNT = 30
 RATE_LIMIT_WINDOW_SECONDS = 600.0
@@ -107,7 +109,21 @@ class ProvisioningHandler(BaseHTTPRequestHandler):
             return
         # Count failed attempts too, so a leaked or guessed token cannot be
         # brute-forced without tripping the same per-client limiter.
-        if not self._authorized():
+        token = self.headers.get("X-KT-Provision-Token", "")
+        customer_key = token.startswith("ktd_")
+        if customer_key:
+            if self.server.enrollment is None:
+                self._json(503, {"error": "automatic device enrollment is not enabled"})
+                return
+            try:
+                self.server.enrollment.check(token)
+            except EnrollmentDenied:
+                self._json(401, {"error": "invalid device activation key"})
+                return
+            except Exception:
+                self._json(503, {"error": "device enrollment unavailable"})
+                return
+        elif not self._authorized():
             self._json(401, {"error": "provisioning authorization failed"})
             return
         try:
@@ -120,10 +136,19 @@ class ProvisioningHandler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(length)
             payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict) or set(payload) != {
-                "origin", "installation_id", "endpoint_url"
-            }:
+            if not isinstance(payload, dict):
+                raise ValueError("invalid request object")
+            device_mode = "enrollment_version" in payload or "ssh_public_key" in payload
+            if customer_key and not device_mode:
+                self._json(401, {"error": "customer keys require device enrollment"})
+                return
+            fields = {"origin", "installation_id", "endpoint_url"}
+            if device_mode:
+                fields |= {"enrollment_version", "ssh_public_key"}
+            if not isinstance(payload, dict) or set(payload) != fields:
                 raise ValueError("invalid request fields")
+            if device_mode and (type(payload["enrollment_version"]) is not int or payload["enrollment_version"] != 2):
+                raise ValueError("invalid device enrollment version")
             origin = payload["origin"]
             installation_id = payload["installation_id"]
             endpoint_url = payload["endpoint_url"]
@@ -131,6 +156,29 @@ class ProvisioningHandler(BaseHTTPRequestHandler):
                 raise ValueError("invalid request types")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
             self._json(400, {"error": "invalid provisioning request"})
+            return
+        if device_mode:
+            if self.server.enrollment is None:
+                self._json(503, {"error": "automatic device enrollment is not enabled"})
+                return
+            try:
+                if customer_key:
+                    enrolled = self.server.enrollment.provision(token, installation_id, origin, endpoint_url, payload["ssh_public_key"])
+                else:
+                    enrolled = self.server.enrollment.provision_shared(
+                        token, installation_id, origin, endpoint_url, payload["ssh_public_key"],
+                        expected_token=self.server.provision_token,
+                    )
+            except EnrollmentDenied:
+                self._json(401, {"error": "invalid device activation key"})
+            except (EnrollmentConflict, EndpointConflict):
+                self._json(409, {"error": "device activation conflict"})
+            except ValueError:
+                self._json(400, {"error": "invalid device enrollment"})
+            except Exception:
+                self._json(503, {"error": "device enrollment unavailable"})
+            else:
+                self._json(200, enrolled)
             return
         try:
             allocation = self.server.registry.provision(
@@ -170,12 +218,14 @@ class ProvisioningHTTPServer(ThreadingHTTPServer):
         registry: AllocationRegistry,
         *,
         provision_token: str = "",
+        enrollment: EnrollmentService | None = None,
     ) -> None:
         token = provision_token.strip()
         if not token:
             raise ValueError("KT_MCP_PROVISION_ADMIN_TOKEN 必须配置；拒绝匿名 provisioning")
         super().__init__(address, ProvisioningHandler)
         self.registry = registry
+        self.enrollment = enrollment
         self.provision_token = token
         self.rate_limiter = RateLimiter()
 
@@ -188,7 +238,9 @@ def main() -> None:
     registry = AllocationRegistry(settings)
     host = os.environ.get("KT_MCP_PROVISION_BIND", "127.0.0.1")
     port = int(os.environ.get("KT_MCP_PROVISION_PORT", "18080"))
-    server = ProvisioningHTTPServer((host, port), registry, provision_token=token)
+    enrollment_settings = EnrollmentSettings.from_env()
+    enrollment = EnrollmentService(registry, enrollment_settings) if enrollment_settings else None
+    server = ProvisioningHTTPServer((host, port), registry, provision_token=token, enrollment=enrollment)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
