@@ -23,9 +23,14 @@ keeps the endpoint flow compact: local KT setup, provisioning, SSH tunnel, and
 actual public MCP verification before showing an address. Each device must
 enter its authorized HTTPS origin and matching verification key; the key is
 stored only in the local DPAPI-protected profile.
-The origin and verification-key fields always start empty, including on an
-already configured device. Silent startup reads the local profile directly;
-saved settings are not copied into the form.
+The origin and masked verification-key fields restore this device's last fully
+verified connection; the key is encrypted with Windows DPAPI. Failed attempts
+do not overwrite that success record. Older installs fall back to their saved
+profile. Cached input never grants endpoint readiness: a fresh full MCP check
+is still required before an address is shown. GUI startup allows up to 45 seconds
+for tunnel readiness, retrying only transient transport/gateway failures without
+re-registering. Both manual and logon startup continuously monitor and reconnect
+SSH when `auto_reconnect` is enabled; exit cancels waiting and monitoring.
 Use the origin's paste button and the verified MCP address's copy button for
 clipboard access. Tray exit stops services in a background worker, keeps the
 interface responsive, and closes only after shutdown is confirmed.

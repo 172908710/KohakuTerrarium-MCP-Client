@@ -8,7 +8,7 @@
 
 请先关闭旧窗口再使用新的启动入口。直接执行 `python -m kt_mcp_client` 属于旧的源码运行入口，不负责便携版首次初始化。
 
-公网 origin 和验证 key 输入框每次启动均为空，不自动显示已保存的信息；本机保护配置仍保留，开机静默自启直接读取该配置，不依赖输入框内容。
+公网 origin 和验证 key 输入框会回填本机上次完整连接验证成功的设置，key 以星号遮盖并使用 Windows DPAPI 加密保存。失败的尝试不会覆盖成功记录；旧版本升级兼容已有 profile。MCP 地址不会直接从缓存显示，仍需当前公网验证成功。开机静默自启直接读取本机配置。
 
 公网 origin 右侧可点“粘贴”，验证成功的 MCP 地址右侧可点“复制”；剪贴板只在点击时访问。托盘退出会在后台停止本地 MCP 和 SSH 隧道，确认停止后才退出，不重复执行停止命令；停止失败会提示重试。
 
@@ -35,6 +35,7 @@
 项目目录/
   data/
     profile.json              自动生成的本机配置
+    last-successful-connection.json  上次成功的 origin 与 DPAPI 加密 key
     portable-location.json    安装位置标记，不是 endpoint proof
     tools.yaml                点击启动后由客户端生成
     kt-home/                  独立 KT 配置和 endpoint 状态
@@ -63,6 +64,8 @@
 服务端使用 `server/` 中的 provisioning 服务、独立 Nginx route map 和独立 SSH 账号；当前设备分配远端 loopback 端口 `18766`。首次完成设备注册后，注册 token 会以 Windows DPAPI 保护形式写入本机 `data/profile.json`；不会进入源码、Git 或通用便携 ZIP，也不会从生产 Bridge 复制。环境变量 `KT_MCP_PROVISION_TOKEN` 仍可用于一次性脚本覆盖，`KT_MCP_PROVISION_URL` 可用于显式 HTTPS API 地址覆盖（默认 origin 使用 `/provision`）。不要把已注册设备的 `data/` 目录复制给其他设备。
 
 GUI 要求输入本机获授权的 HTTPS origin 和对应验证 key；验证 key 仅以 DPAPI 保护形式保存。按钮会在注册后使用独立设备 SSH 反向隧道，并实际执行公网 MCP `initialize`、`tools/list` 和默认工作区无害 `tree` 只读调用；只有这些步骤全部成功才显示地址。没有服务器、origin、验证 key、隧道或公网路由时，界面会报告具体失败，不会显示虚假的成功地址。`--provision` 使用同一套门禁；`--status`/`--start`/`--stop` 仍可单独管理生命周期。
+
+GUI 启动 SSH 后会等待公网就绪（最多 45 秒），针对暂时断连和 HTTP 408/502/503/504 有限重试，不重复注册；每次都必须完整通过 MCP 握手、工具列表和只读调用。手动启动及开机静默恢复都会持续监测 SSH；`auto_reconnect=true` 时，隧道断开后自动重建，无需再次点按钮。认证/语义错误不会重试，退出会取消等待并停止监测。
 
 勾选“开机自动启动（登录后后台运行）”后，当前 Windows 用户登录时会静默启动客户端，并在已有 origin 和独立设备配置时自动恢复本机 MCP；不会在每次登录时重复注册设备。窗口右上角 `X` 只会隐藏到任务栏通知区域；托盘右键“退出并停止本地 MCP”会停止独立 KT 和 SSH 隧道。开机自启只写入当前用户的 HKCU Run 项，不保存 token、私钥或 endpoint secret。
 

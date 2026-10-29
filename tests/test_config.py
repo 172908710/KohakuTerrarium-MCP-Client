@@ -15,6 +15,9 @@ from kt_mcp_client.config import (
     canonicalize_origin,
     canonicalize_runtime_root,
     load,
+    load_successful_connection,
+    remember_successful_connection,
+    LAST_CONNECTION_FILENAME,
     mcp_url,
     parse_endpoint_url,
     set_actual_endpoint,
@@ -126,6 +129,48 @@ def test_provision_token_is_dpapi_protected_and_restored(tmp_path, monkeypatch):
     loaded = load()
     assert loaded.provision_token == original.provision_token
     assert "provision_token" not in public_dict(original)
+
+
+def test_last_successful_connection_protects_key_and_survives_failed_profile_update(tmp_path):
+    value = profile(tmp_path, provision_token="last-good-key")
+    filename = remember_successful_connection(value, tmp_path)
+    assert filename.name == LAST_CONNECTION_FILENAME
+    raw = filename.read_text(encoding="utf-8")
+    assert "last-good-key" not in raw
+    assert "provision_token_protected" in raw
+    if sys.platform == "win32":
+        assert "dpapi:" in raw
+    assert load_successful_connection(tmp_path) == (value.public_origin, "last-good-key")
+    value.public_origin = "https://bad-next.example.invalid"
+    value.provision_token = "invalid-later-key"
+    save(value, tmp_path)
+    assert load_successful_connection(tmp_path) == ("https://device.example.invalid", "last-good-key")
+    assert "invalid-later-key" not in filename.read_text(encoding="utf-8")
+
+
+def test_last_connection_migrates_legacy_profile_without_trusting_endpoint(tmp_path):
+    value = profile(tmp_path, provision_token="legacy-key")
+    save(value, tmp_path)
+    assert load_successful_connection(tmp_path) == (value.public_origin, "legacy-key")
+    assert (tmp_path / LAST_CONNECTION_FILENAME).exists()
+    value.provision_token = "failed-new-key"
+    save(value, tmp_path)
+    assert load_successful_connection(tmp_path)[1] == "legacy-key"
+    assert not load(tmp_path).endpoint_verified
+
+
+def test_last_connection_bad_data_never_returns_credentials(tmp_path):
+    file = tmp_path / LAST_CONNECTION_FILENAME
+    file.write_text('{"version": 1, "origin": "http://unsafe", "provision_token_protected":""}')
+    with pytest.raises(ConfigError):
+        load_successful_connection(tmp_path)
+    file.write_text("not-json")
+    with pytest.raises(ConfigError):
+        load_successful_connection(tmp_path)
+
+
+def test_last_connection_new_install_is_empty(tmp_path):
+    assert load_successful_connection(tmp_path) == ("", "")
 
 
 def test_actual_endpoint_url_is_required_and_migrates_legacy_secret(tmp_path):

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +43,10 @@ PRODUCTION_CONNECTION_PATH = Path(
 )
 INSTALLATION_ID_FILENAME = "installation_id"
 PROVISION_TIMEOUT = 15.0
+_PUBLIC_VERIFICATION_ATTEMPT_TIMEOUT = 8.0
+_PUBLIC_VERIFICATION_POLL_INTERVAL = 0.1
+_PUBLIC_VERIFICATION_TIME_EPSILON = 1e-9
+_RETRYABLE_PUBLIC_HTTP_STATUSES = frozenset({408, 502, 503, 504})
 # The independent profile mirrors the live formal MCP surface. Keep this
 # explicit so a missing Studio hook cannot be mistaken for successful public
 # enrollment merely because ``initialize`` returned 200.
@@ -71,6 +77,10 @@ class ProvisioningError(RuntimeError):
 
 class ProvisioningUnavailable(ProvisioningError):
     """Raised when the server-side provisioning API is not available."""
+
+
+class PublicVerificationCancelled(ProvisioningError):
+    """Raised when public readiness verification is cancelled by the caller."""
 
 
 @dataclass(frozen=True)
@@ -504,22 +514,80 @@ def _parse_remote_port(payload: Mapping[str, Any]) -> int:
     return port
 
 
+def _public_verification_budget(timeout: float) -> float:
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProvisioningError("公网 MCP 验证 timeout 必须是有限非负秒数") from exc
+    if not math.isfinite(budget) or budget < 0:
+        raise ProvisioningError("公网 MCP 验证 timeout 必须是有限非负秒数")
+    return budget
+
+
+def _public_verification_failure(exc: Exception) -> Exception:
+    # Only our availability wrapper carries retryable network failures.
+    # A validation/tool error remains terminal even if it has a chained cause.
+    if isinstance(exc, ProvisioningUnavailable) and isinstance(exc.__cause__, Exception):
+        return exc.__cause__
+    return exc
+
+
+def _public_verification_reason(exc: Exception) -> str:
+    """Describe a failure without URLs, response bodies, or exception text."""
+
+    failure = _public_verification_failure(exc)
+    if isinstance(failure, httpx.HTTPStatusError):
+        return f"HTTP {failure.response.status_code}"
+    # Use names from a fixed set rather than an arbitrary subclass's name or
+    # message; either could contain data supplied by a remote peer/test double.
+    for error_type in (
+        httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+        httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.CloseError,
+        httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ProxyError,
+        httpx.UnsupportedProtocol, httpx.TransportError, httpx.HTTPError,
+        TimeoutError, OSError, ValueError, TypeError,
+    ):
+        if isinstance(failure, error_type):
+            return error_type.__name__
+    return "verification error"
+
+
+def _public_verification_unavailable(exc: Exception) -> ProvisioningUnavailable:
+    return ProvisioningUnavailable(
+        f"公网 MCP 连通性验证失败（{_public_verification_reason(exc)}）；地址未确认可用。"
+    )
+
+
+def _public_verification_retryable(exc: Exception) -> bool:
+    failure = _public_verification_failure(exc)
+    return isinstance(failure, httpx.TransportError) or (
+        isinstance(failure, httpx.HTTPStatusError)
+        and failure.response.status_code in _RETRYABLE_PUBLIC_HTTP_STATUSES
+    )
+
+
 def _decode_mcp_response(response: httpx.Response) -> Mapping[str, Any]:
     response.raise_for_status()
     content_type = response.headers.get("content-type", "").casefold()
+    payload: Any = None
     if "application/json" in content_type:
-        payload = response.json()
-        if isinstance(payload, Mapping):
-            return payload
-    for line in response.text.splitlines():
-        if line.startswith("data: "):
-            try:
-                payload = json.loads(line[6:])
-            except json.JSONDecodeError as exc:
-                raise ProvisioningError("公网 MCP 返回了无效 JSON") from exc
-            if isinstance(payload, Mapping):
-                return payload
-    raise ProvisioningError("公网 MCP 没有返回 JSON-RPC 响应")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProvisioningError("公网 MCP 返回了无效 JSON") from exc
+    else:
+        for line in response.text.splitlines():
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError as exc:
+                    raise ProvisioningError("公网 MCP 返回了无效 JSON") from exc
+                break
+    if not isinstance(payload, Mapping):
+        raise ProvisioningError("公网 MCP 没有返回 JSON-RPC 响应")
+    if "error" in payload:
+        raise ProvisioningError("公网 MCP 返回了 JSON-RPC error；地址未确认可用。")
+    return payload
 
 
 def verify_public_endpoint(
@@ -532,23 +600,41 @@ def verify_public_endpoint(
 
     Registration and an alive SSH process are not sufficient: this performs
     MCP initialize, tools/list, and a harmless tree call in the configured
-    default workspace before a URL is reported as usable.
+    default workspace before a URL is reported as usable. ``timeout`` is the
+    budget for the entire exchange, not a fresh timeout for each of its four
+    requests. Each HTTP request uses only the remaining monotonic budget;
+    an expired exchange can never produce verification evidence.
     """
 
+    budget = _public_verification_budget(timeout)
+    deadline = time.monotonic() + budget
     canonical_endpoint = canonicalize_endpoint_url(endpoint_url, profile.public_origin)
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
     }
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= _PUBLIC_VERIFICATION_TIME_EPSILON:
+            raise httpx.ReadTimeout("Public MCP verification deadline exceeded")
+        return remaining
+
     try:
         # Keep the portable runtime dependency-free: HTTP/1.1 is sufficient
         # for the MCP POST/SSE contract and does not require the optional h2
-        # package.
-        with httpx.Client(timeout=timeout, trust_env=False, http2=False) as client:
-            init_response = client.post(
-                canonical_endpoint,
-                headers=headers,
-                json={
+        # package. No worker thread is created for synchronous verification.
+        with httpx.Client(timeout=remaining_timeout(), trust_env=False, http2=False) as client:
+            def post(payload: Mapping[str, Any]) -> httpx.Response:
+                return client.post(
+                    canonical_endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=remaining_timeout(),
+                )
+
+            init_response = post(
+                {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
@@ -570,30 +656,25 @@ def verify_public_endpoint(
             )
             if isinstance(session_id, str) and session_id:
                 headers["Mcp-Session-Id"] = session_id
-            protocol_version = str(result.get("protocolVersion") or "")
-            if not protocol_version:
+            protocol_version = result.get("protocolVersion")
+            if not isinstance(protocol_version, str) or not protocol_version:
                 raise ProvisioningError("公网 MCP initialize 未返回 protocolVersion")
             headers["MCP-Protocol-Version"] = protocol_version
-            notice = client.post(
-                canonical_endpoint,
-                headers=headers,
-                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-            )
+            notice = post({"jsonrpc": "2.0", "method": "notifications/initialized"})
             notice.raise_for_status()
-            listed = _decode_mcp_response(client.post(
-                canonical_endpoint,
-                headers=headers,
-                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            listed = _decode_mcp_response(post(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             ))
             listed_result = listed.get("result")
             raw_tools = listed_result.get("tools") if isinstance(listed_result, Mapping) else None
-            if not isinstance(raw_tools, list):
-                raise ProvisioningError("公网 MCP tools/list 未返回工具列表")
-            tool_names = tuple(
-                str(item.get("name"))
+            if not isinstance(raw_tools, list) or any(
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("name"), str)
+                or not item["name"]
                 for item in raw_tools
-                if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-            )
+            ):
+                raise ProvisioningError("公网 MCP tools/list 未返回有效工具列表")
+            tool_names = tuple(item["name"] for item in raw_tools)
             missing_tools = sorted(EXPECTED_PARITY_TOOLS.difference(tool_names))
             if missing_tools:
                 raise ProvisioningError(
@@ -605,10 +686,8 @@ def verify_public_endpoint(
             arguments: dict[str, Any] = {"workspace_id": profile.workspace_id}
             if readonly_tool == "tree":
                 arguments["path"] = "."
-            called = _decode_mcp_response(client.post(
-                canonical_endpoint,
-                headers=headers,
-                json={
+            called = _decode_mcp_response(post(
+                {
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "tools/call",
@@ -616,13 +695,124 @@ def verify_public_endpoint(
                 },
             ))
             called_result = called.get("result")
-            if not isinstance(called_result, Mapping) or called_result.get("isError") is True:
+            if (
+                not isinstance(called_result, Mapping)
+                or not isinstance(called_result.get("content"), list)
+                or not isinstance(called_result.get("isError", False), bool)
+                or called_result.get("isError") is True
+            ):
                 raise ProvisioningError("公网 MCP 默认只读工具调用失败")
+            # The tree/workspaces readiness probe produces text content. Do
+            # not accept malformed entries or unknown content kinds as proof
+            # merely because the outer content value happened to be a list.
+            if any(
+                not isinstance(block, Mapping)
+                or block.get("type") != "text"
+                or not isinstance(block.get("text"), str)
+                for block in called_result["content"]
+            ):
+                raise ProvisioningError("公网 MCP 默认只读工具返回了无效文本内容")
+            remaining_timeout()
+        remaining_timeout()
     except ProvisioningError:
         raise
     except (httpx.HTTPError, TimeoutError, OSError, ValueError, TypeError) as exc:
-        raise ProvisioningUnavailable("公网 MCP 连通性验证失败；地址未确认可用。") from exc
+        raise _public_verification_unavailable(exc) from exc
     return PublicVerification(protocol_version, tool_names, readonly_tool)
+
+
+def wait_for_public_endpoint(
+    endpoint_url: str,
+    profile: DeviceProfile,
+    *,
+    timeout: float = 45.0,
+    cancelled: Callable[[], bool] | None = None,
+    on_retry: Callable[[int, str], None] | None = None,
+    verify: Callable[..., PublicVerification] | None = None,
+) -> PublicVerification:
+    """Wait for the public MCP route, without retrying endpoint registration.
+
+    ``timeout`` is a finite, non-negative total readiness budget. ``verify``
+    defaults to :func:`verify_public_endpoint`, resolved at call time, and is
+    called with ``(endpoint_url, profile, timeout=min(8.0, remaining))``. An
+    injected verifier must honor that timeout and perform the full exchange.
+
+    Only httpx transport errors and HTTP 408/502/503/504 are retried, either
+    directly or as the cause of ``ProvisioningUnavailable``. Authentication,
+    routing, JSON-RPC, payload, and tool-validation errors fail immediately.
+    ``on_retry(failed_attempt, safe_reason)`` receives a one-based attempt
+    number and only an HTTP status/error type, never exception text or a URL.
+
+    ``cancelled`` is a callable (use ``event.is_set`` for a threading.Event).
+    It is checked before/after attempts and at most every 0.1s during backoff
+    of 1s, 2s, then 3s. In-flight HTTP is bounded by the attempt timeout rather
+    than abandoned in a background thread; cancellation never returns stale
+    success evidence. Backoff also consumes a logical budget so mocked clocks
+    or sleeps cannot create an unbounded retry loop.
+    """
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise PublicVerificationCancelled("公网 MCP 验证已取消；地址未确认可用。")
+
+    check_cancelled()
+    budget = _public_verification_budget(timeout)
+    deadline = time.monotonic() + budget
+    unspent_wait_budget = budget
+    verify_endpoint = verify_public_endpoint if verify is None else verify
+    attempt = 0
+    last_error: Exception | None = None
+
+    def remaining_budget() -> float:
+        remaining = min(unspent_wait_budget, deadline - time.monotonic())
+        # Do not start another network exchange for a floating-point residue
+        # left by subtracting the last polling interval from the budget.
+        return remaining if remaining > _PUBLIC_VERIFICATION_TIME_EPSILON else 0.0
+
+    while True:
+        check_cancelled()
+        remaining = remaining_budget()
+        if remaining <= 0:
+            reason = f"（{_public_verification_reason(last_error)}）" if last_error is not None else ""
+            raise ProvisioningUnavailable(
+                f"公网 MCP 就绪等待超时{reason}；地址未确认可用。"
+            ) from last_error
+        attempt += 1
+        try:
+            verified = verify_endpoint(
+                endpoint_url, profile,
+                timeout=min(_PUBLIC_VERIFICATION_ATTEMPT_TIMEOUT, remaining),
+            )
+        except (ProvisioningError, httpx.HTTPError, TimeoutError, OSError, ValueError, TypeError) as exc:
+            check_cancelled()
+            if not _public_verification_retryable(exc):
+                if isinstance(exc, ProvisioningError):
+                    raise
+                raise _public_verification_unavailable(exc) from exc
+            last_error = exc
+        else:
+            check_cancelled()
+            if remaining_budget() > 0:
+                return verified
+            # A verifier that finishes after its deadline is not readiness
+            # evidence, even if every individual request eventually succeeded.
+            last_error = httpx.ReadTimeout("Public MCP verification deadline exceeded")
+
+        remaining = remaining_budget()
+        if remaining <= 0:
+            continue
+        if on_retry is not None:
+            on_retry(attempt, _public_verification_reason(last_error))
+        check_cancelled()
+        delay = min(float(attempt), 3.0, remaining_budget())
+        while delay > _PUBLIC_VERIFICATION_TIME_EPSILON:
+            check_cancelled()
+            interval = min(delay, _PUBLIC_VERIFICATION_POLL_INTERVAL, remaining_budget())
+            if interval <= 0:
+                break
+            time.sleep(interval)
+            unspent_wait_budget = max(0.0, unspent_wait_budget - interval)
+            delay = max(0.0, delay - interval)
 
 
 def _validate_current_profile(
@@ -809,6 +999,7 @@ __all__ = [
     "PROVISIONING_NOT_CONFIGURED_MESSAGE",
     "ProvisionedEndpoint",
     "PublicVerification",
+    "PublicVerificationCancelled",
     "ProvisioningError",
     "ProvisioningUnavailable",
     "canonicalize_endpoint_url",
@@ -825,4 +1016,5 @@ __all__ = [
     "request_endpoint",
     "request_independent_endpoint",
     "verify_public_endpoint",
+    "wait_for_public_endpoint",
 ]

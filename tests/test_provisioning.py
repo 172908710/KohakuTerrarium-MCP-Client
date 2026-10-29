@@ -2,9 +2,12 @@
 
 import json
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
+import httpx
 import pytest
 
 from kt_mcp_client import provisioning
@@ -15,6 +18,8 @@ from kt_mcp_client.provisioning import (
     KT_MCP_PROVISION_TOKEN,
     MAX_RESPONSE_BYTES,
     PROVISIONING_NOT_CONFIGURED_MESSAGE,
+    PublicVerification,
+    PublicVerificationCancelled,
     ProvisioningError,
     ProvisioningUnavailable,
     discover_default_origin,
@@ -23,6 +28,8 @@ from kt_mcp_client.provisioning import (
     installation_id_path,
     provision_and_save,
     request_independent_endpoint,
+    verify_public_endpoint,
+    wait_for_public_endpoint,
 )
 
 TOKEN = "P" * 43
@@ -323,3 +330,615 @@ def test_provision_and_save_does_not_save_mismatched_response(tmp_path, monkeypa
             opener=lambda request, timeout: FakeResponse({"url": OTHER_ENDPOINT}),
         )
     assert not load(config).endpoint_verified
+
+
+class FakeClock:
+    """A monotonic clock whose waits consume no wall time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waits: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        assert 0 < seconds <= 0.1
+        self.waits.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def readiness_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    clock = FakeClock()
+    # Replace only provisioning's reference, not the shared stdlib module
+    # used by pytest, httpx, or other test workers.
+    monkeypatch.setattr(provisioning, "time", clock)
+    return clock
+
+
+@pytest.fixture
+def public_profile() -> DeviceProfile:
+    return DeviceProfile(
+        public_origin="https://device.example.invalid", workspace_id="synthetic-workspace"
+    )
+
+
+PUBLIC_EVIDENCE = PublicVerification(
+    "2025-03-26", tuple(sorted(provisioning.EXPECTED_PARITY_TOOLS)), "tree"
+)
+
+
+def public_http_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", ENDPOINT)
+    return httpx.HTTPStatusError(
+        f"HTTP error at {ENDPOINT}", request=request,
+        response=httpx.Response(status, request=request, text=f"sensitive body {TOKEN}"),
+    )
+
+
+def install_public_transport(monkeypatch: pytest.MonkeyPatch, handler):
+    """Use real httpx response/cleanup semantics, but never open a socket."""
+
+    original_client = httpx.Client
+    clients: list[httpx.Client] = []
+
+    def make_client(**kwargs):
+        assert kwargs["trust_env"] is False
+        assert kwargs["http2"] is False
+        assert 0 < kwargs["timeout"] <= 15.0
+        client = original_client(transport=httpx.MockTransport(handler), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(provisioning, "httpx", SimpleNamespace(
+        **{name: getattr(httpx, name) for name in dir(httpx) if not name.startswith("_")},
+    ))
+    monkeypatch.setattr(provisioning.httpx, "Client", make_client)
+    return clients
+
+
+def successful_public_response(request: httpx.Request, *, sse: bool = False) -> httpx.Response:
+    body = json.loads(request.content)
+    method = body["method"]
+    headers: dict[str, str] = {}
+    if method == "notifications/initialized":
+        return httpx.Response(202)
+    if method == "initialize":
+        result = {"protocolVersion": "2025-03-26"}
+        headers["mcp-session-id"] = "synthetic-session"
+    elif method == "tools/list":
+        result = {"tools": [{"name": name} for name in PUBLIC_EVIDENCE.tools]}
+    else:
+        assert method == "tools/call"
+        result = {"content": [{"type": "text", "text": "synthetic tree"}], "isError": False}
+    payload = {"jsonrpc": "2.0", "id": body["id"], "result": result}
+    if sse:
+        headers["content-type"] = "text/event-stream"
+        return httpx.Response(200, headers=headers, text=f"event: message\ndata: {json.dumps(payload)}\n\n")
+    return httpx.Response(200, headers=headers, json=payload)
+
+
+@pytest.mark.parametrize("sse", [False, True])
+def test_public_verification_requires_complete_mcp_exchange(
+    monkeypatch, readiness_clock, public_profile, sse,
+):
+    requests: list[httpx.Request] = []
+    timeouts: list[float] = []
+
+    def handler(request):
+        requests.append(request)
+        timeouts.append(request.extensions["timeout"]["read"])
+        readiness_clock.now += 0.5
+        return successful_public_response(request, sse=sse)
+
+    clients = install_public_transport(monkeypatch, handler)
+    assert verify_public_endpoint(ENDPOINT, public_profile, timeout=4.0) == PUBLIC_EVIDENCE
+    assert [json.loads(request.content)["method"] for request in requests] == [
+        "initialize", "notifications/initialized", "tools/list", "tools/call"
+    ]
+    assert timeouts == pytest.approx([4.0, 3.5, 3.0, 2.5])
+    for request in requests[1:]:
+        assert request.headers["Mcp-Session-Id"] == "synthetic-session"
+        assert request.headers["MCP-Protocol-Version"] == "2025-03-26"
+        assert str(request.url) == ENDPOINT
+    assert json.loads(requests[-1].content)["params"] == {
+        "name": "tree", "arguments": {"workspace_id": "synthetic-workspace", "path": "."},
+    }
+    assert len(clients) == 1 and clients[0].is_closed
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 500, 502, 503, 504])
+def test_public_http_failure_reports_safe_status_and_keeps_cause(
+    monkeypatch, readiness_clock, public_profile, status,
+):
+    clients = install_public_transport(
+        monkeypatch, lambda request: httpx.Response(status, text=f"secret: {ENDPOINT}")
+    )
+    with pytest.raises(ProvisioningUnavailable, match=f"HTTP {status}") as error:
+        verify_public_endpoint(ENDPOINT, public_profile)
+    assert isinstance(error.value.__cause__, httpx.HTTPStatusError)
+    assert ENDPOINT not in str(error.value)
+    assert TOKEN not in str(error.value)
+    assert clients[0].is_closed
+
+
+@pytest.mark.parametrize("error_type", [
+    httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+    httpx.RemoteProtocolError, ValueError, TypeError, OSError,
+])
+def test_public_failure_reports_safe_error_type_and_keeps_cause(
+    monkeypatch, readiness_clock, public_profile, error_type,
+):
+    failure = error_type(f"failure at {ENDPOINT}")
+
+    def handler(request):
+        raise failure
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningUnavailable, match=error_type.__name__) as error:
+        verify_public_endpoint(ENDPOINT, public_profile)
+    assert error.value.__cause__ is failure
+    assert TOKEN not in str(error.value)
+    assert ENDPOINT not in str(error.value)
+    assert clients[0].is_closed
+
+
+def test_public_verification_deadline_is_shared_by_all_requests(
+    monkeypatch, readiness_clock, public_profile,
+):
+    methods: list[str] = []
+    timeouts: list[float] = []
+
+    def handler(request):
+        methods.append(json.loads(request.content)["method"])
+        remaining = request.extensions["timeout"]["read"]
+        timeouts.append(remaining)
+        readiness_clock.now += min(0.75, remaining)
+        return successful_public_response(request)
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningUnavailable, match="ReadTimeout") as error:
+        verify_public_endpoint(ENDPOINT, public_profile, timeout=2.0)
+    assert methods == ["initialize", "notifications/initialized", "tools/list"]
+    assert timeouts == pytest.approx([2.0, 1.25, 0.5])
+    assert readiness_clock.now == 2.0
+    assert isinstance(error.value.__cause__, httpx.ReadTimeout)
+    assert clients[0].is_closed
+
+
+def test_public_verification_rejects_late_final_success(
+    monkeypatch, readiness_clock, public_profile,
+):
+    methods: list[str] = []
+
+    def handler(request):
+        methods.append(json.loads(request.content)["method"])
+        readiness_clock.now += request.extensions["timeout"]["read"] if len(methods) == 4 else 0.1
+        return successful_public_response(request)
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningUnavailable, match="ReadTimeout"):
+        verify_public_endpoint(ENDPOINT, public_profile, timeout=1.0)
+    assert methods == ["initialize", "notifications/initialized", "tools/list", "tools/call"]
+    assert readiness_clock.now == pytest.approx(1.0)
+    assert clients[0].is_closed
+
+
+@pytest.mark.parametrize("case", ["auth", "payload"])
+def test_late_terminal_failure_is_not_reclassified_as_retryable_timeout(
+    monkeypatch, readiness_clock, public_profile, case,
+):
+    attempts: list[float] = []
+
+    def handler(request):
+        attempts.append(request.extensions["timeout"]["read"])
+        # Expire the 8-second attempt, but leave total readiness time. The
+        # terminal response must not be masked by a transport-like deadline.
+        readiness_clock.now += request.extensions["timeout"]["read"] + 0.1
+        if case == "auth":
+            return httpx.Response(403, text=ENDPOINT)
+        return httpx.Response(200, headers={"content-type": "application/json"}, text=ENDPOINT)
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningError, match="HTTP 403" if case == "auth" else "无效 JSON"):
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile,
+            on_retry=lambda *args: pytest.fail("late terminal response must not retry"),
+        )
+    assert attempts == [8.0]
+    assert readiness_clock.waits == []
+    assert len(clients) == 1 and clients[0].is_closed
+
+
+@pytest.mark.parametrize("case,expected_calls", [
+    ("invalid_json", 1), ("invalid_sse", 1), ("non_object", 1),
+    ("initialize_error", 1), ("initialize_no_result", 1),
+    ("initialize_no_protocol", 1), ("initialize_bad_protocol", 1),
+    ("list_error", 3), ("list_no_tools", 3), ("list_missing_tools", 3),
+    ("list_malformed_tool", 3), ("call_error", 4), ("call_is_error", 4),
+    ("call_no_result", 4), ("call_empty_result", 4), ("call_bad_error_flag", 4),
+])
+def test_public_payload_and_tool_failures_never_retry(
+    monkeypatch, readiness_clock, public_profile, case, expected_calls,
+):
+    requests: list[httpx.Request] = []
+    retries: list[object] = []
+
+    def handler(request):
+        requests.append(request)
+        body = json.loads(request.content)
+        method = body["method"]
+        response = successful_public_response(request)
+        if method == "initialize":
+            if case == "invalid_json":
+                return httpx.Response(200, headers={"content-type": "application/json"}, text=ENDPOINT)
+            if case == "invalid_sse":
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=f"data: {ENDPOINT}\n")
+            if case == "non_object":
+                return httpx.Response(200, json=[ENDPOINT])
+            if case == "initialize_error":
+                return httpx.Response(200, json={"error": {"message": ENDPOINT}, "result": {"protocolVersion": "2025-03-26"}})
+            if case == "initialize_no_result":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1})
+            if case == "initialize_no_protocol":
+                return httpx.Response(200, json={"result": {}})
+            if case == "initialize_bad_protocol":
+                return httpx.Response(200, json={"result": {"protocolVersion": {"secret": ENDPOINT}}})
+        elif method == "tools/list":
+            if case == "list_error":
+                return httpx.Response(200, json={"error": {"message": ENDPOINT}})
+            if case == "list_no_tools":
+                return httpx.Response(200, json={"result": {}})
+            if case == "list_missing_tools":
+                return httpx.Response(200, json={"result": {"tools": [{"name": "tree"}]}})
+            if case == "list_malformed_tool":
+                payload = response.json()
+                payload["result"]["tools"].append({"name": 123})
+                return httpx.Response(200, json=payload)
+        elif method == "tools/call":
+            if case == "call_error":
+                return httpx.Response(200, json={"error": {"message": ENDPOINT}})
+            if case == "call_is_error":
+                return httpx.Response(200, json={"result": {"isError": True, "content": [{"text": ENDPOINT}]}})
+            if case == "call_no_result":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 3})
+            if case == "call_empty_result":
+                return httpx.Response(200, json={"result": {}})
+            if case == "call_bad_error_flag":
+                return httpx.Response(200, json={"result": {"content": [], "isError": ENDPOINT}})
+        return response
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningError) as error:
+        wait_for_public_endpoint(ENDPOINT, public_profile, on_retry=lambda *args: retries.append(args))
+    assert not isinstance(error.value, ProvisioningUnavailable)
+    assert ENDPOINT not in str(error.value)
+    assert TOKEN not in str(error.value)
+    assert retries == [] and readiness_clock.waits == []
+    assert len(requests) == expected_calls
+    assert len(clients) == 1 and clients[0].is_closed
+
+
+@pytest.mark.parametrize("content", [
+    [None], [ENDPOINT], [{}], [{"type": "text"}],
+    [{"type": "text", "text": None}], [{"type": "text", "text": 123}],
+    [{"type": "unknown", "text": ENDPOINT}],
+    [{"type": "text", "text": "valid"}, None],
+])
+def test_public_malformed_readonly_content_is_terminal(
+    monkeypatch, readiness_clock, public_profile, content,
+):
+    methods: list[str] = []
+
+    def handler(request):
+        methods.append(json.loads(request.content)["method"])
+        if methods[-1] == "tools/call":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 3, "result": {
+                "content": content, "isError": False,
+            }})
+        return successful_public_response(request)
+
+    clients = install_public_transport(monkeypatch, handler)
+    with pytest.raises(ProvisioningError, match="无效文本内容") as error:
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile,
+            on_retry=lambda *args: pytest.fail("malformed content must never retry"),
+        )
+    assert not isinstance(error.value, ProvisioningUnavailable)
+    assert ENDPOINT not in str(error.value) and TOKEN not in str(error.value)
+    assert methods == ["initialize", "notifications/initialized", "tools/list", "tools/call"]
+    assert readiness_clock.waits == []
+    assert len(clients) == 1 and clients[0].is_closed
+
+
+@pytest.mark.parametrize("status", [408, 502, 503, 504])
+def test_wait_retries_transient_gateway_until_full_verification(
+    monkeypatch, readiness_clock, public_profile, status,
+):
+    methods: list[str] = []
+    retries: list[tuple[int, str]] = []
+
+    def handler(request):
+        method = json.loads(request.content)["method"]
+        methods.append(method)
+        if len(methods) == 1:
+            return httpx.Response(status, text=ENDPOINT)
+        return successful_public_response(request)
+
+    clients = install_public_transport(monkeypatch, handler)
+    monkeypatch.setattr(provisioning, "provision_and_save", lambda *args, **kwargs: pytest.fail("registration must never repeat"))
+    assert wait_for_public_endpoint(
+        ENDPOINT, public_profile, on_retry=lambda *args: retries.append(args)
+    ) == PUBLIC_EVIDENCE
+    assert methods == ["initialize", "initialize", "notifications/initialized", "tools/list", "tools/call"]
+    assert retries == [(1, f"HTTP {status}")]
+    assert readiness_clock.now == pytest.approx(1.0)
+    assert len(clients) == 2 and all(client.is_closed for client in clients)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout])
+def test_wait_retries_transport_error_and_resolves_default_at_call_time(
+    monkeypatch, readiness_clock, public_profile, wrapped, error_type,
+):
+    attempts: list[tuple[str, DeviceProfile, float]] = []
+    retries: list[tuple[int, str]] = []
+    failure = error_type(f"failed at {ENDPOINT}")
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append((endpoint, profile, timeout))
+        if len(attempts) < 3:
+            if wrapped:
+                raise ProvisioningUnavailable(f"unsafe wrapper {ENDPOINT}") from failure
+            raise failure
+        return PUBLIC_EVIDENCE
+
+    monkeypatch.setattr(provisioning, "verify_public_endpoint", verify)
+    assert wait_for_public_endpoint(
+        ENDPOINT, public_profile, on_retry=lambda *args: retries.append(args)
+    ) is PUBLIC_EVIDENCE
+    assert [(endpoint, profile) for endpoint, profile, timeout in attempts] == [(ENDPOINT, public_profile)] * 3
+    assert [timeout for endpoint, profile, timeout in attempts] == [8.0, 8.0, 8.0]
+    assert retries == [(1, error_type.__name__), (2, error_type.__name__)]
+    assert readiness_clock.now == pytest.approx(3.0)
+    assert all(TOKEN not in reason and ENDPOINT not in reason for attempt, reason in retries)
+
+
+def test_wait_final_deadline_sanitizes_wrapped_transient_error(readiness_clock, public_profile):
+    failure = public_http_error(503)
+    failures: list[ProvisioningUnavailable] = []
+
+    def verify(endpoint, profile, *, timeout):
+        wrapper = ProvisioningUnavailable(f"unsafe wrapper {ENDPOINT}")
+        failures.append(wrapper)
+        raise wrapper from failure
+
+    with pytest.raises(ProvisioningUnavailable, match="超时.*HTTP 503") as error:
+        wait_for_public_endpoint(ENDPOINT, public_profile, timeout=0.25, verify=verify)
+    assert len(failures) == 1
+    assert error.value.__cause__ is failures[0]
+    assert failures[0].__cause__ is failure
+    assert ENDPOINT not in str(error.value) and TOKEN not in str(error.value)
+
+
+@pytest.mark.parametrize("status", [301, 400, 401, 403, 404, 405, 429, 500, 501])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_wait_does_not_retry_non_gateway_http_errors(
+    readiness_clock, public_profile, status, wrapped,
+):
+    attempts: list[float] = []
+    failure = public_http_error(status)
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append(timeout)
+        if wrapped:
+            raise ProvisioningUnavailable(f"HTTP {status}") from failure
+        raise failure
+
+    with pytest.raises(ProvisioningUnavailable, match=f"HTTP {status}") as error:
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, verify=verify,
+            on_retry=lambda *args: pytest.fail("non-gateway errors must not retry"),
+        )
+    assert attempts == [8.0] and readiness_clock.waits == []
+    assert ENDPOINT not in str(error.value) and TOKEN not in str(error.value)
+    assert error.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("failure", [
+    ProvisioningError("missing tool"), ProvisioningUnavailable("unclassified failure"),
+    ValueError(ENDPOINT), TypeError(ENDPOINT), OSError(ENDPOINT), TimeoutError(ENDPOINT),
+])
+def test_wait_fails_closed_for_non_httpx_errors(readiness_clock, public_profile, failure):
+    attempts: list[float] = []
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append(timeout)
+        raise failure
+
+    with pytest.raises(ProvisioningError) as error:
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, verify=verify,
+            on_retry=lambda *args: pytest.fail("unclassified errors must not retry"),
+        )
+    assert attempts == [8.0] and readiness_clock.waits == []
+    if isinstance(failure, ProvisioningError):
+        assert error.value is failure
+    else:
+        assert error.value.__cause__ is failure
+        assert ENDPOINT not in str(error.value)
+
+
+def test_wait_does_not_retry_validation_error_even_with_transport_cause(readiness_clock, public_profile):
+    failure = httpx.ReadTimeout(ENDPOINT)
+
+    def verify(endpoint, profile, *, timeout):
+        raise ProvisioningError("malformed result") from failure
+
+    with pytest.raises(ProvisioningError, match="malformed result"):
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, verify=verify,
+            on_retry=lambda *args: pytest.fail("validation error must not retry"),
+        )
+    assert readiness_clock.waits == []
+
+
+def test_wait_deadline_caps_attempts_and_backoff(readiness_clock, public_profile):
+    attempts: list[tuple[float, float]] = []
+    retries: list[tuple[int, str]] = []
+    failure = httpx.ConnectTimeout(ENDPOINT)
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append((readiness_clock.now, timeout))
+        readiness_clock.now += min(0.25, timeout)
+        raise failure
+
+    with pytest.raises(ProvisioningUnavailable, match="超时.*ConnectTimeout") as error:
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, timeout=11.0, verify=verify,
+            on_retry=lambda *args: retries.append(args),
+        )
+    assert [start for start, timeout in attempts] == pytest.approx([0, 1.25, 3.5, 6.75, 10.0])
+    assert [timeout for start, timeout in attempts] == pytest.approx([8, 8, 7.5, 4.25, 1.0])
+    assert retries == [(index, "ConnectTimeout") for index in range(1, 6)]
+    assert readiness_clock.now == pytest.approx(11.0)
+    assert all(0 < interval <= 0.1 for interval in readiness_clock.waits)
+    assert error.value.__cause__ is failure
+    assert TOKEN not in str(error.value) and ENDPOINT not in str(error.value)
+
+
+def test_wait_shrinks_last_attempt_to_remaining_total_budget(readiness_clock, public_profile):
+    attempts: list[float] = []
+    failure = httpx.ConnectError(ENDPOINT)
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append(timeout)
+        if len(attempts) == 1:
+            raise failure
+        readiness_clock.now += timeout
+        raise httpx.ReadTimeout(ENDPOINT)
+
+    with pytest.raises(ProvisioningUnavailable, match="超时"):
+        wait_for_public_endpoint(ENDPOINT, public_profile, timeout=1.25, verify=verify)
+    assert attempts == pytest.approx([1.25, 0.25])
+    assert readiness_clock.now == pytest.approx(1.25)
+
+
+def test_wait_deadline_still_terminates_with_frozen_mock_clock(monkeypatch, public_profile):
+    attempts: list[float] = []
+    waits: list[float] = []
+    failure = httpx.ConnectError(ENDPOINT)
+    monkeypatch.setattr(provisioning, "time", SimpleNamespace(
+        monotonic=lambda: 0.0, sleep=lambda interval: waits.append(interval),
+    ))
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append(timeout)
+        assert len(attempts) <= 20, "frozen clocks must not cause infinite retries"
+        raise failure
+
+    with pytest.raises(ProvisioningUnavailable, match="超时"):
+        wait_for_public_endpoint(ENDPOINT, public_profile, timeout=45.0, verify=verify)
+    assert 1 < len(attempts) <= 20
+    assert sum(waits) == pytest.approx(45.0)
+    assert max(waits) <= 0.1
+
+
+def test_wait_never_accepts_success_after_deadline(readiness_clock, public_profile):
+    def verify(endpoint, profile, *, timeout):
+        assert timeout == 0.5
+        readiness_clock.now += 0.6
+        return PUBLIC_EVIDENCE
+
+    with pytest.raises(ProvisioningUnavailable, match="超时"):
+        wait_for_public_endpoint(ENDPOINT, public_profile, timeout=0.5, verify=verify)
+    assert readiness_clock.waits == []
+
+
+def test_wait_cancellation_before_attempt_has_no_side_effects(readiness_clock, public_profile):
+    with pytest.raises(PublicVerificationCancelled, match="取消"):
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, cancelled=lambda: True,
+            verify=lambda *args, **kwargs: pytest.fail("cancelled before first attempt"),
+        )
+    assert readiness_clock.waits == []
+    assert issubclass(PublicVerificationCancelled, ProvisioningError)
+
+
+def test_wait_cancellation_during_backoff_uses_event_callable(
+    monkeypatch, readiness_clock, public_profile,
+):
+    stop = Event()
+    attempts: list[float] = []
+    original_sleep = readiness_clock.sleep
+
+    def sleep(interval):
+        original_sleep(interval)
+        stop.set()
+
+    monkeypatch.setattr(readiness_clock, "sleep", sleep)
+
+    def verify(endpoint, profile, *, timeout):
+        attempts.append(timeout)
+        raise httpx.ConnectError(ENDPOINT)
+
+    with pytest.raises(PublicVerificationCancelled, match="取消"):
+        wait_for_public_endpoint(ENDPOINT, public_profile, cancelled=stop.is_set, verify=verify)
+    assert attempts == [8.0]
+    assert readiness_clock.waits == [0.1]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_wait_cancellation_during_attempt_never_returns_success(
+    readiness_clock, public_profile, outcome,
+):
+    stop = Event()
+
+    def verify(endpoint, profile, *, timeout):
+        stop.set()
+        if outcome == "failure":
+            raise httpx.ConnectTimeout(ENDPOINT)
+        return PUBLIC_EVIDENCE
+
+    with pytest.raises(PublicVerificationCancelled, match="取消"):
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, verify=verify, cancelled=stop.is_set,
+            on_retry=lambda *args: pytest.fail("cancelled attempt must not retry"),
+        )
+    assert readiness_clock.waits == []
+
+
+def test_wait_cancellation_from_retry_callback_skips_wait(readiness_clock, public_profile):
+    stop = Event()
+
+    def verify(endpoint, profile, *, timeout):
+        raise httpx.ConnectError(ENDPOINT)
+
+    with pytest.raises(PublicVerificationCancelled):
+        wait_for_public_endpoint(
+            ENDPOINT, public_profile, verify=verify, cancelled=stop.is_set,
+            on_retry=lambda attempt, reason: stop.set(),
+        )
+    assert readiness_clock.waits == []
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), float("-inf"), float("nan"), -1.0, "invalid"])
+@pytest.mark.parametrize("function", [verify_public_endpoint, wait_for_public_endpoint])
+def test_public_verification_rejects_invalid_budget_before_network(
+    monkeypatch, readiness_clock, public_profile, timeout, function,
+):
+    monkeypatch.setattr(httpx, "Client", lambda *args, **kwargs: pytest.fail("invalid timeout must not make requests"))
+    with pytest.raises(ProvisioningError, match="timeout"):
+        function(ENDPOINT, public_profile, timeout=timeout)
+    assert readiness_clock.waits == []
+
+
+@pytest.mark.parametrize("function", [verify_public_endpoint, wait_for_public_endpoint])
+def test_public_verification_zero_budget_never_attempts_network(
+    monkeypatch, readiness_clock, public_profile, function,
+):
+    monkeypatch.setattr(httpx, "Client", lambda *args, **kwargs: pytest.fail("expired budget must not make requests"))
+    with pytest.raises(ProvisioningUnavailable):
+        function(ENDPOINT, public_profile, timeout=0)
+    assert readiness_clock.waits == []

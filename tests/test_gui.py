@@ -125,22 +125,20 @@ def form_gui(monkeypatch):
 
 
 @pytest.mark.parametrize("startup_mode", [False, True])
-def test_form_starts_empty_even_with_saved_settings(form_gui, monkeypatch, startup_mode):
+def test_form_restores_last_successful_settings(form_gui, monkeypatch, startup_mode):
     loads = []
 
-    def saved_profile(path):
+    def saved_connection(path):
         loads.append(path)
-        return SimpleNamespace(
-            public_origin="https://device.example.invalid",
-            provision_token="synthetic-saved-key",
-        )
+        return "https://device.example.invalid/", "synthetic-saved-key"
 
-    monkeypatch.setattr(gui, "load", saved_profile)
+    monkeypatch.setattr(gui, "load_successful_connection", saved_connection)
     value = gui.ClientGUI(startup_mode=startup_mode)
 
-    assert value.origin_var.get() == ""
-    assert value.provision_key_var.get() == ""
-    assert loads == []
+    assert value.origin_var.get() == "https://device.example.invalid"
+    assert value.provision_key_var.get() == "synthetic-saved-key"
+    assert value.output_var.get() == ""
+    assert loads == [None]
 
 
 @pytest.mark.parametrize("saved_origin,expected_resume", [
@@ -154,6 +152,9 @@ def test_silent_startup_uses_saved_origin_not_empty_form(
 ):
     instances = []
     resumed = []
+    monkeypatch.setattr(gui, "load_successful_connection", lambda path: (
+        saved_origin, "synthetic-saved-key"
+    ))
     monkeypatch.setattr(gui, "load", lambda path: SimpleNamespace(
         public_origin=saved_origin, provision_token="synthetic-saved-key"
     ))
@@ -164,15 +165,18 @@ def test_silent_startup_uses_saved_origin_not_empty_form(
     gui.run_gui(startup_mode=True)
 
     assert form_gui.hidden
-    assert instances[0].origin_var.get() == ""
-    assert instances[0].provision_key_var.get() == ""
+    assert instances[0].origin_var.get() == (saved_origin if expected_resume else "")
+    assert instances[0].provision_key_var.get() == ("synthetic-saved-key" if expected_resume else "")
     assert len(form_gui.callbacks) == int(expected_resume)
     form_gui.drain()
     assert resumed == ([True] if expected_resume else [])
 
 
-def test_normal_launch_does_not_read_saved_settings(form_gui, monkeypatch):
-    monkeypatch.setattr(gui, "load", lambda path: pytest.fail("Normal launch must not load credentials"))
+def test_normal_launch_reads_saved_input_without_starting_services(form_gui, monkeypatch):
+    monkeypatch.setattr(gui, "load_successful_connection", lambda path: (
+        "https://device.example.invalid", "saved-key"
+    ))
+    monkeypatch.setattr(gui, "load", lambda path: pytest.fail("No runtime/profile reload needed"))
     monkeypatch.setattr(gui.ClientGUI, "_ensure_tray", lambda self: True)
     monkeypatch.setattr(gui.ClientGUI, "run", lambda self: None)
 
@@ -536,7 +540,31 @@ def _wait_for_worker(value: gui.ClientGUI) -> None:
     raise AssertionError("GUI worker did not finish")
 
 
-def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_path):
+@pytest.fixture
+def adopted_supervisor(monkeypatch):
+    owners = []
+
+    class Owner:
+        def __init__(self, profile, runtime_root, *, runtime, tunnel):
+            self.profile, self.runtime, self.tunnel = profile, runtime, tunnel
+            self.monitored = False
+            self.retired = False
+            owners.append(self)
+
+        def monitor(self):
+            assert all(owner.retired for owner in owners if owner is not self), "Only one monitor may own the pair"
+            self.retired = False
+            self.monitored = True
+
+        def stop_monitoring(self):
+            self.retired = True
+            self.monitored = False
+
+    monkeypatch.setattr(gui, "Supervisor", Owner)
+    return owners
+
+
+def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_path, adopted_supervisor):
     value = _gui_without_tk()
     value.config_path = str(tmp_path)
     endpoint = "https://device.example.invalid/mcp/" + ("Q" * 43)
@@ -573,7 +601,7 @@ def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_pa
         "remote_forward_port": 18766, "local_port": 8865,
         "ssh_host": "vps.example.invalid", "ssh_user": "kt",
         "ssh_identity_file": str(identity), "ssh_known_hosts": str(known_hosts),
-        "ssh_port": 2222, "ssh_extra_options": [], "secret": "",
+        "ssh_port": 2222, "ssh_extra_options": [], "secret": "", "provision_token": "test-key",
     })())
     monkeypatch.setattr(gui, "KTRuntime", FakeRuntime)
 
@@ -594,7 +622,7 @@ def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_pa
         def __init__(self, *args, **kwargs): pass
         def start(self): return FakeTunnelStatus()
     monkeypatch.setattr(gui, "SSHTunnel", FakeTunnel)
-    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile: None)
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile, **kw: None)
     Path(value.config_path, "profile.json").write_text("{}", encoding="utf-8")
     value.request_endpoint()
     _wait_for_worker(value)
@@ -604,6 +632,31 @@ def test_button_uses_worker_and_runtime_url_before_provision(monkeypatch, tmp_pa
     assert value.output_var.get() == endpoint
     assert "公网 MCP 已完成" in value.status_var.get()
     assert value.request_button.states == ["disabled", "normal"]
+    assert len(adopted_supervisor) == 1
+    assert adopted_supervisor[0].monitored
+    assert value._supervisor.runtime is value._runtime
+    assert value._supervisor.tunnel is value._tunnel
+    # A second completed request retires its previous owner, never duplicates it.
+    value.request_endpoint()
+    _wait_for_worker(value)
+    assert len(adopted_supervisor) == 2
+    assert adopted_supervisor[0].retired
+    assert adopted_supervisor[1].monitored
+    assert value.output_var.get() == endpoint
+    current = value._supervisor
+    value.provision_key_var.set("incorrect-new-key")
+    def rejected(*args, **kwargs):
+        raise gui.ProvisioningError("HTTP 403 rejected")
+    monkeypatch.setattr(gui, "provision_and_save", rejected)
+    value.request_endpoint()
+    _wait_for_worker(value)
+    assert "403" in value.status_var.get()
+    assert value._supervisor is current
+    assert value._runtime is current.runtime
+    assert value._tunnel is current.tunnel
+    assert current.monitored
+    from kt_mcp_client.config import load_successful_connection
+    assert load_successful_connection(tmp_path)[1] == "test-key"
 
 
 def test_logon_resume_starts_saved_services_without_reregistering(monkeypatch, tmp_path):
@@ -620,7 +673,7 @@ def test_logon_resume_starts_saved_services_without_reregistering(monkeypatch, t
 
     monkeypatch.setattr(gui, "config_file", lambda path: Path(path) / "profile.json")
     monkeypatch.setattr(gui, "load", lambda path: type("Profile", (), {
-        "public_origin": "https://device.example.invalid",
+        "public_origin": "https://device.example.invalid", "provision_token": "saved-key",
     })())
 
     class FakeRuntime:
@@ -633,15 +686,17 @@ def test_logon_resume_starts_saved_services_without_reregistering(monkeypatch, t
             self.runtime = FakeRuntime()
             self.tunnel = object()
 
-        def start(self):
+        def start(self, *, wait_for_public=True):
+            assert wait_for_public is False
             calls.append("start")
-            return type("Status", (), {"state": "running", "detail": ""})()
+            return type("Status", (), {"state": "degraded", "detail": "public pending"})()
 
         def stop(self):
             calls.append("stop")
 
     monkeypatch.setattr(gui, "Supervisor", FakeSupervisor)
-    monkeypatch.setattr(gui, "verify_public_endpoint", lambda value, profile: calls.append("verify"))
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda value, profile, **kw: calls.append("verify"))
+    monkeypatch.setattr(gui, "remember_successful_connection", lambda profile, path: pytest.fail("Resume cannot validate provision key"))
 
     assert value._resume_saved_services() == endpoint
     assert calls == ["start", "url", "verify"]
@@ -676,7 +731,7 @@ def test_missing_runtime_configuration_is_clear_and_does_not_provision(monkeypat
         def __init__(self, *args, **kwargs): pass
         def start(self): return FakeTunnelStatus()
     monkeypatch.setattr(gui, "SSHTunnel", FakeTunnel)
-    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile: None)
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile, **kw: None)
     value.request_endpoint()
     _wait_for_worker(value)
 
@@ -705,7 +760,7 @@ def test_button_does_not_fake_url_when_api_is_unavailable(monkeypatch, tmp_path)
         "remote_forward_port": 18766, "local_port": 8865,
         "ssh_host": "vps.example.invalid", "ssh_user": "kt",
         "ssh_identity_file": str(identity), "ssh_known_hosts": str(known_hosts),
-        "ssh_port": 2222, "ssh_extra_options": [], "secret": "",
+        "ssh_port": 2222, "ssh_extra_options": [], "secret": "", "provision_token": "test-key",
     })())
     monkeypatch.setattr(gui, "KTRuntime", lambda *args, **kwargs: type("Runtime", (), {
         "setup": lambda self: None,
@@ -743,7 +798,7 @@ def test_button_does_not_accept_terminal_status_with_local_ready(monkeypatch, tm
         "remote_forward_port": 18766, "local_port": 8865,
         "ssh_host": "vps.example.invalid", "ssh_user": "kt",
         "ssh_identity_file": str(identity), "ssh_known_hosts": str(known_hosts),
-        "ssh_port": 2222, "ssh_extra_options": [], "secret": "",
+        "ssh_port": 2222, "ssh_extra_options": [], "secret": "", "provision_token": "test-key",
     })())
     monkeypatch.setattr(gui, "KTRuntime", lambda *args, **kwargs: type("Runtime", (), {
         "setup": lambda self: None,
@@ -770,7 +825,7 @@ def test_button_does_not_accept_terminal_status_with_local_ready(monkeypatch, tm
         def __init__(self, *args, **kwargs): pass
         def start(self): return FakeTunnelStatus()
     monkeypatch.setattr(gui, "SSHTunnel", FakeTunnel)
-    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile: None)
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile, **kw: None)
     value.request_endpoint()
     _wait_for_worker(value)
 
@@ -780,7 +835,7 @@ def test_button_does_not_accept_terminal_status_with_local_ready(monkeypatch, tm
     assert value.request_button.states == ["disabled", "normal"]
 
 
-def test_button_ignores_second_click_until_first_callback_is_drained(monkeypatch, tmp_path):
+def test_button_ignores_second_click_until_first_callback_is_drained(monkeypatch, tmp_path, adopted_supervisor):
     value = _gui_without_tk()
     root = QueuedRoot()
     value.root = root
@@ -802,7 +857,7 @@ def test_button_ignores_second_click_until_first_callback_is_drained(monkeypatch
         "remote_forward_port": 18766, "local_port": 8865,
         "ssh_host": "vps.example.invalid", "ssh_user": "kt",
         "ssh_identity_file": str(identity), "ssh_known_hosts": str(known_hosts),
-        "ssh_port": 2222, "ssh_extra_options": [], "secret": "",
+        "ssh_port": 2222, "ssh_extra_options": [], "secret": "", "provision_token": "test-key",
     })())
 
     class FakeRuntime:
@@ -841,7 +896,7 @@ def test_button_ignores_second_click_until_first_callback_is_drained(monkeypatch
         def __init__(self, *args, **kwargs): pass
         def start(self): return FakeTunnelStatus()
     monkeypatch.setattr(gui, "SSHTunnel", FakeTunnel)
-    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile: None)
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda endpoint, profile, **kw: None)
     value.request_endpoint()
     first_worker = value._worker
     assert first_worker is not None
@@ -904,6 +959,56 @@ def test_progress_remains_visible_while_worker_waits(monkeypatch):
     _wait_for_worker(value)
     assert "HTTP 404" in value.status_var.get()
     assert not value.progress_bar.running
+
+
+def test_form_corrupt_saved_settings_does_not_prevent_opening(form_gui, monkeypatch):
+    def corrupt(path):
+        raise gui.ConfigError("DPAPI unavailable")
+    monkeypatch.setattr(gui, "load_successful_connection", corrupt)
+    value = gui.ClientGUI()
+    assert value.origin_var.get() == value.provision_key_var.get() == ""
+
+
+def test_readiness_success_remembers_only_after_verification(monkeypatch, tmp_path):
+    from kt_mcp_client.config import DeviceProfile, load_successful_connection
+    value = _gui_without_tk()
+    value.config_path = str(tmp_path)
+    profile = DeviceProfile(public_origin="https://device.example.invalid", provision_token="good-key")
+    calls = []
+    def verify(endpoint, passed, **kwargs):
+        assert passed is profile
+        assert value.output_var.get() == ""
+        assert load_successful_connection(tmp_path) == ("", "")
+        calls.append("verify")
+    monkeypatch.setattr(gui, "verify_public_endpoint", verify)
+    value._wait_for_public("https://device.example.invalid/mcp/" + "Q" * 43, profile)
+    assert calls == ["verify"]
+    assert load_successful_connection(tmp_path) == (profile.public_origin, "good-key")
+    # No UI variable changes from the worker; main-loop event performs backfill.
+    assert value.provision_key_var.get() == ""
+    value._poll_events()
+    assert value.provision_key_var.get() == "good-key"
+    assert value.output_var.get() == ""
+
+
+def test_failed_or_cancelled_readiness_never_overwrites_last_success(monkeypatch, tmp_path):
+    from kt_mcp_client.config import DeviceProfile, remember_successful_connection, load_successful_connection
+    value = _gui_without_tk()
+    value.config_path = str(tmp_path)
+    profile = DeviceProfile(public_origin="https://device.example.invalid", provision_token="good-key")
+    remember_successful_connection(profile, tmp_path)
+    profile.provision_token = "bad-key"
+    def verify(endpoint, passed, **kwargs):
+        raise gui.ProvisioningError("HTTP 403")
+    monkeypatch.setattr(gui, "verify_public_endpoint", verify)
+    with pytest.raises(gui.ProvisioningError, match="403"):
+        value._wait_for_public("https://device.example.invalid/mcp/" + "Q" * 43, profile)
+    assert load_successful_connection(tmp_path)[1] == "good-key"
+    value._shutdown_requested = True
+    monkeypatch.setattr(gui, "verify_public_endpoint", lambda *a, **kw: pytest.fail("Cancelled request may not verify"))
+    with pytest.raises(gui.ProvisioningError):
+        value._wait_for_public("https://device.example.invalid/mcp/" + "Q" * 43, profile)
+    assert load_successful_connection(tmp_path)[1] == "good-key"
 
 
 def test_worker_never_calls_tk_after_window_closes(monkeypatch):

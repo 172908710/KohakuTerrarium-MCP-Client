@@ -151,7 +151,7 @@ def test_cli_provision_runs_runtime_before_network_and_prints_only_local_endpoin
     monkeypatch.setattr(cli, "config_file", lambda path: tmp_path / "profile.json")
     monkeypatch.setattr(cli, "KTRuntime", FakeRuntime)
     monkeypatch.setattr(cli, "provision_and_save", provision)
-    monkeypatch.setattr(cli, "verify_public_endpoint", lambda endpoint, profile: None)
+    monkeypatch.setattr(cli, "verify_public_endpoint", lambda endpoint, profile, **kw: None)
     class FakeTunnelProcess:
         running = True
         identity_ok = True

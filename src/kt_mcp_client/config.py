@@ -833,6 +833,68 @@ def save(profile: DeviceProfile, path: str | os.PathLike[str] | None = None) -> 
     return filename
 
 
+LAST_CONNECTION_FILENAME = "last-successful-connection.json"
+
+
+def load_successful_connection(path: str | os.PathLike[str] | None = None) -> tuple[str, str]:
+    """Restore form fields, never an endpoint proof or a ready/running flag.
+
+    Older clients kept only the profile; use that as a one-time compatible
+    fallback until a fully verified connection writes its own success record.
+    A failed later registration can update the runtime profile without erasing
+    this last known-good pair.
+    """
+    filename = config_file(path).parent / LAST_CONNECTION_FILENAME
+    try:
+        with filename.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        previous = load(path)
+        if not previous.public_origin or not previous.provision_token:
+            return "", ""
+        origin = canonicalize_origin(previous.public_origin)
+        # Migrate once before a failed later registration can mutate profile.
+        # This restores legacy input only; it never grants endpoint readiness.
+        remember_successful_connection(previous, path)
+        return origin, previous.provision_token
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("无法读取上次成功连接的设置，请重新输入") from exc
+    if not isinstance(payload, Mapping) or payload.get("version") != 1:
+        raise ConfigError("上次成功连接的设置格式无效，请重新输入")
+    protected = payload.get("provision_token_protected")
+    if not isinstance(protected, str):
+        raise ConfigError("上次成功连接的验证 key 格式无效，请重新输入")
+    return canonicalize_origin(payload.get("origin", "")), _unprotect_secret(protected)
+
+
+def remember_successful_connection(
+    profile: DeviceProfile, path: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Persist only after the complete public MCP verification has succeeded."""
+    filename = config_file(path).parent / LAST_CONNECTION_FILENAME
+    payload = {
+        "version": 1,
+        "origin": canonicalize_origin(profile.public_origin),
+        "provision_token_protected": _protect_secret(profile.provision_token),
+    }
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".last-connection-", suffix=".json", dir=str(filename.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, filename)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return filename
+
+
 __all__ = [
     "CONFIG_ENV",
     "CONFIG_FILENAME",
@@ -859,6 +921,9 @@ __all__ = [
     "endpoint_proof_is_current",
     "invalidate_endpoint",
     "load",
+    "load_successful_connection",
+    "remember_successful_connection",
+    "LAST_CONNECTION_FILENAME",
     "mcp_url",
     "parse_endpoint_url",
     "public_dict",

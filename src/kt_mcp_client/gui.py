@@ -8,7 +8,9 @@ import tkinter as tk
 import os
 from tkinter import scrolledtext, ttk
 
-from .config import ConfigError, config_file, load
+from .config import (
+    ConfigError, config_file, load, load_successful_connection, remember_successful_connection,
+)
 from .kt_runtime import KTRuntime, KTRuntimeError
 from .ssh_tunnel import SSHTunnel, SSHTunnelError, validate_ssh_profile
 from .provisioning import (
@@ -21,6 +23,7 @@ from .provisioning import (
     normalize_origin,
     provision_and_save,
     verify_public_endpoint,
+    wait_for_public_endpoint,
 )
 from .startup import StartupError, is_startup_enabled, set_startup_enabled
 from .supervisor import Supervisor, SupervisorError
@@ -58,9 +61,10 @@ class ClientGUI:
         self.root.minsize(640, 180)
         self.config_path = config_path
         self.startup_mode = bool(startup_mode)
-        # Saved connection settings stay in the backend, never in the form.
-        self.origin_var = tk.StringVar(value="")
-        self.provision_key_var = tk.StringVar(value="")
+        # Restore only connection input; never assume a cached endpoint is live.
+        saved_origin, saved_key = self._saved_form_settings()
+        self.origin_var = tk.StringVar(value=saved_origin)
+        self.provision_key_var = tk.StringVar(value=saved_key)
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="状态：等待请求")
         self.elapsed_var = tk.StringVar(value="准备就绪")
@@ -88,6 +92,16 @@ class ClientGUI:
         self.startup_var = tk.BooleanVar(value=self._startup_enabled)
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _saved_form_settings(self) -> tuple[str, str]:
+        try:
+            origin, key = load_successful_connection(self.config_path)
+            if not origin or normalize_origin(origin) == normalize_origin(DEFAULT_ORIGIN):
+                return "", ""
+            return normalize_origin(origin), key
+        except (ConfigError, ProvisioningError, OSError, ValueError, TypeError):
+            # Corrupt/foreign-user DPAPI data must not prevent the GUI opening.
+            return "", ""
 
     @staticmethod
     def _read_startup_state() -> bool:
@@ -387,6 +401,9 @@ class ClientGUI:
             if kind == "progress":
                 self._stage, self._stage_at = value, extra
                 self.status_var.set("状态：" + value)
+            elif kind == "saved_connection":
+                self.origin_var.set(value)
+                self.provision_key_var.set(extra)
             elif kind == "result":
                 self._finish_request(value, extra)
         if self._worker is not None:
@@ -394,11 +411,48 @@ class ClientGUI:
             self.elapsed_var.set(f"已用 {now - self._started_at:.1f} 秒")
             self._poll_id = self.root.after(100, self._poll_events)
 
+    def _pause_monitoring(self) -> Supervisor | None:
+        """Retire the previous owner before adopting this config again.
+
+        Never join a monitor while holding the GUI service lock. The shutdown
+        worker joins startup first, so it cannot race a replacement here.
+        """
+        previous = getattr(self, "_supervisor", None)
+        if previous is not None:
+            previous.stop_monitoring()
+            with self._service_lock:
+                self._supervisor = None
+        return previous
+
+    def _wait_for_public(self, endpoint_url: str, profile, *, remember: bool = True) -> None:
+        self._report_progress("等待 SSH 隧道就绪并验证公网 MCP（最多 45 秒）")
+        wait_for_public_endpoint(
+            endpoint_url,
+            profile,
+            cancelled=lambda: bool(getattr(self, "_shutdown_requested", False)),
+            on_retry=lambda attempt, reason: self._report_progress(
+                f"等待公网就绪，第 {attempt} 次重试：{reason}"
+            ),
+            verify=verify_public_endpoint,
+        )
+        if getattr(self, "_shutdown_requested", False):
+            raise ProvisioningError("客户端正在退出；未保存连接结果")
+        if remember:
+            remember_successful_connection(profile, self.config_path)
+            # Queue UI input changes; workers must never touch Tk variables.
+            self._events.put(("saved_connection", profile.public_origin, profile.provision_token))
+
     def _runtime_and_provision(self, origin: str, provision_key: str = "") -> str:
         self._report_progress("[1/4] 检查本机配置与服务器注册凭据")
         filename = config_file(self.config_path)
         if not filename.is_file():
             raise ProvisioningError(RUNTIME_CONFIG_MISSING_MESSAGE)
+        # Snapshot legacy input before KT's URL refresh can save its profile.
+        # A corrupt optional history file must not block manually fixing input.
+        try:
+            load_successful_connection(self.config_path)
+        except (ConfigError, OSError):
+            pass
         profile = load(self.config_path)
         missing = [name for name, value in (
             ("kt_python", profile.kt_python), ("workspace_path", profile.workspace_path)
@@ -409,8 +463,9 @@ class ClientGUI:
         # An omitted key keeps a previously loaded DPAPI token.  This matters
         # for legacy/programmatic callers that invoke the worker without the
         # new optional form field; an explicitly supplied key still replaces it.
-        if str(provision_key or "").strip():
-            profile.provision_token = str(provision_key).strip()
+        saved_token = getattr(profile, "provision_token", "")
+        requested_token = str(provision_key or "").strip() or saved_token
+        profile.provision_token = requested_token
         # If the operator did not provide a separate API override, the
         # explicitly entered origin is the intended /provision target.
         previous_provision_url = os.environ.get("KT_MCP_PROVISION_URL")
@@ -420,8 +475,13 @@ class ClientGUI:
         # Missing credentials and unsafe origin/override combinations must fail
         # now, not after an expensive KT startup.
         # This is local validation only; it does not claim the API is reachable.
+        previous_owner = None
         try:
             check_provisioning_configuration(profile.public_origin, profile=profile)
+            # KT url() persists its profile. Do not store an unvalidated new
+            # registration key before the registration service accepts it.
+            profile.provision_token = saved_token
+            previous_owner = self._pause_monitoring()
             config_root = filename.parent
             runtime = KTRuntime(profile, config_root / "runtime", config_root=config_root)
             service_lock = getattr(self, "_service_lock", None)
@@ -446,6 +506,7 @@ class ClientGUI:
                 raise KTRuntimeError("客户端正在退出；未提交公网注册")
             self._report_progress("[4/4] 本地 KT 已就绪，读取真实地址并提交服务器注册")
             endpoint_url = runtime.url()
+            profile.provision_token = requested_token
             provision_and_save(profile.public_origin, endpoint_url, profile=profile, config_path=self.config_path)
             missing_ssh = [
                 name for name in ("ssh_host", "ssh_user", "ssh_identity_file", "ssh_known_hosts")
@@ -476,13 +537,41 @@ class ClientGUI:
                 raise SSHTunnelError(getattr(tunnel_status, "detail", "SSH 隧道未 ready"))
             if getattr(self, "_shutdown_requested", False):
                 raise SSHTunnelError("客户端正在退出；未完成公网验证")
-            verify_public_endpoint(endpoint_url, profile)
+            # One lifecycle owner adopts the exact pair used for enrollment.
+            # Monitoring starts even if the first public check is still pending.
+            supervisor = Supervisor(
+                profile, config_root / "runtime", runtime=runtime, tunnel=tunnel,
+            )
+            if service_lock is None:
+                self._supervisor = supervisor
+            else:
+                with service_lock:
+                    self._supervisor = supervisor
+            supervisor.monitor()
+            self._wait_for_public(endpoint_url, profile)
             return endpoint_url
         finally:
             if had_provision_env:
                 os.environ["KT_MCP_PROVISION_URL"] = str(previous_provision_url)
             else:
                 os.environ.pop("KT_MCP_PROVISION_URL", None)
+            # A failed retry must not strand a previously healthy pair without
+            # a reconnect owner. Transfer ownership only after replacement.
+            if (
+                previous_owner is not None
+                and self._supervisor is None
+                and not getattr(self, "_shutdown_requested", False)
+            ):
+                with self._service_lock:
+                    self._supervisor = previous_owner
+                    self._runtime = previous_owner.runtime
+                    self._tunnel = previous_owner.tunnel
+                try:
+                    previous_owner.monitor()
+                except Exception:
+                    # Preserve the registration/startup error; shutdown still
+                    # retains the old owner and can stop its exact pair.
+                    self._report_progress("原连接监测恢复失败，请重试连接")
 
     def _resume_saved_services(self) -> str:
         """Restart an already enrolled device without re-registering it."""
@@ -492,6 +581,7 @@ class ClientGUI:
         if not filename.is_file():
             raise SupervisorError(RUNTIME_CONFIG_MISSING_MESSAGE)
         profile = load(filename)
+        self._pause_monitoring()
         supervisor = Supervisor(profile, filename.parent / "runtime")
         service_lock = getattr(self, "_service_lock", None)
         if service_lock is None:
@@ -505,15 +595,15 @@ class ClientGUI:
                 self._tunnel = supervisor.tunnel
         if getattr(self, "_shutdown_requested", False):
             raise SupervisorError("客户端正在退出；未恢复独立 MCP")
-        status = supervisor.start()
-        if status.state != "running":
+        status = supervisor.start(wait_for_public=False)
+        if status.state not in {"running", "degraded"}:
             raise SupervisorError(status.detail or "本机 MCP 或 SSH 隧道未 ready")
         if getattr(self, "_shutdown_requested", False):
             raise SupervisorError("客户端正在退出；未完成公网验证")
         self._report_progress("[2/3] 读取本机 endpoint")
         endpoint_url = supervisor.runtime.url()
         self._report_progress("[3/3] 验证公网 MCP")
-        verify_public_endpoint(endpoint_url, profile)
+        self._wait_for_public(endpoint_url, profile, remember=False)
         return endpoint_url
 
     def _finish_request(self, endpoint: str | None, error: BaseException | None) -> None:

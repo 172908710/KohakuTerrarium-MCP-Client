@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from .config import ConfigError, config_file, load
+from .config import ConfigError, config_file, load, remember_successful_connection
 from .gui import run_gui
 from .instance import GUIInstance, InstanceError
 from .kt_runtime import KTRuntime, KTRuntimeError
@@ -13,6 +13,7 @@ from .provisioning import (
     check_provisioning_configuration,
     provision_and_save,
     verify_public_endpoint,
+    wait_for_public_endpoint,
 )
 from .ssh_tunnel import SSHTunnel, SSHTunnelError, validate_ssh_profile
 from .supervisor import Supervisor, SupervisorError
@@ -108,7 +109,8 @@ def _provision(args: argparse.Namespace, profile, config_root) -> str:
         raise SupervisorError("provisioning 已成功，但 SSH 隧道未 ready：" + detail + "；未输出 URL")
 
     try:
-        verify_public_endpoint(endpoint_url, profile)
+        wait_for_public_endpoint(endpoint_url, profile, verify=verify_public_endpoint)
+        remember_successful_connection(profile, args.config or config_root)
     except (ProvisioningError, ValueError) as exc:
         raise ProvisioningError("provisioning/SSH 已完成，但公网 MCP 验证失败；未输出 URL") from exc
 

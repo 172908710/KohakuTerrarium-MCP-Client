@@ -79,8 +79,11 @@ def main() -> None:
                 "r=Path.cwd();prepare_environment(r);"
                 "gui.load=lambda path:SimpleNamespace("
                 "public_origin='https://device.example.invalid',provision_token='synthetic-check-key');"
+                "gui.load_successful_connection=lambda path:('https://device.example.invalid','synthetic-check-key');"
                 "w=tk.Tk();w.withdraw();g=gui.ClientGUI(w,config_path=str(r/'data/profile.json'));"
-                "assert g.origin_entry.get()=='' and g.provision_key_entry.get()=='';"
+                "assert g.origin_entry.get()=='https://device.example.invalid' and g.provision_key_entry.get()=='synthetic-check-key';"
+                "assert g.provision_key_entry.cget('show')=='*';"
+                "assert g.output_var.get()=='';"
                 "assert g._has_saved_origin();"
                 "assert g.copy_button.instate(['disabled']);"
                 "clip={'text':'  https://pasted.example.invalid  '};"
@@ -102,7 +105,8 @@ def main() -> None:
             assert "GUI_OK" in run(["-c", gui_probe])
             report.update(relocation_verified=True, gui_created=True, initialized_local_profile=True,
                           system_python_removed_from_path=True, poisoned_python_environment_ignored=True,
-                          gui_fields_blank_with_saved_settings=True, saved_origin_available_for_startup=True,
+                          gui_fields_restore_saved_settings=True, verification_key_masked=True,
+                          cached_endpoint_never_shown=True, saved_origin_available_for_startup=True,
                           clipboard_buttons_verified_with_synthetic_data=True,
                           top_right_status_layout_verified=True, content_height_verified=True)
             if args.with_local_mcp:

@@ -27,7 +27,7 @@
 - “开机自动启动（登录后后台运行）”开关；
 - 状态提示。
 
-每次打开软件时，公网 origin 和验证 key 输入框均为空，不自动回填已保存的信息。已有本机配置仍保留，开机静默自启直接读取配置，不依赖输入框内容。
+每次打开软件时，会回填本机上次完整连接验证成功的公网 origin 和验证 key，key 仍以星号遮盖并使用 Windows DPAPI 加密保存。之后失败的尝试不会覆盖这份成功记录；升级旧版时兼容读取已有本机配置。回填不代表公网已经在线，MCP 地址仍需本次完整验证成功后才显示。开机静默自启直接读取本机配置。
 
 公网 origin 右侧的“粘贴”按钮只在点击时读取剪贴板；MCP 地址右侧的“复制”按钮仅在地址验证成功后可用。托盘退出在后台停止服务，界面不会等待停止命令而卡住；停止失败会保留界面提示重试，不会假装已经完全退出。
 
@@ -35,7 +35,7 @@
 
 按钮需要**单独的服务端/VPS provisioning API**。客户端向 `KT_MCP_PROVISION_URL` 指定的 HTTPS API 发送 JSON POST；未设置该环境变量时，默认 origin 使用 `/provision`。请求包含 origin、保存在独立配置根中的非 secret `installation_id`，以及本机独立 KT 已产生的完整 `endpoint_url`。服务端只接受该 URL 中的 secret 作为唯一来源，不生成或替换 secret；服务端返回的 `url`/`endpoint_url` 必须与本机 endpoint 完全一致，并可附带 `remote_port`。注册 token 可在配置阶段写入 `profile.json` 的 Windows DPAPI 保护字段，双击重启后仍可使用；它不会进入通用便携包或子进程环境。API 本身不会建立隧道。
 
-如果没有配置 API、API 返回 404、无法连接或响应格式/URL 不合法，界面会提示失败，不会伪造或显示 provisioning 返回的 URL，也不会复用生产 secret。注册和 SSH 隧道启动后，客户端还会实际执行公网 MCP `initialize`、`tools/list` 及默认工作区的无害 `tree` 只读调用；只有本地 KT endpoint、provisioning 响应和公网连通性全部验证成功时，完整 URL 才显示为成功结果。验证不会调用 write/edit/bash/python 或 Studio 变更工具。
+如果没有配置 API、API 返回 404、无法连接或响应格式/URL 不合法，界面会提示失败，不会伪造或显示 provisioning 返回的 URL，也不会复用生产 secret。注册和 SSH 隧道启动后，GUI 会在最多 45 秒的就绪窗口内等待公网连通；只对暂时的连接错误及 HTTP 408/502/503/504 进行有限重试，不会重复注册设备。客户端实际执行公网 MCP `initialize`、`tools/list` 及默认工作区的无害 `tree` 只读调用；只有完整验证成功才显示地址。认证失败、工具集不完整等错误直接失败，不会靠重试绕过验证。GUI 在手动启动和静默恢复两条路径都保留唯一的生命周期管理器，`auto_reconnect=true` 时持续检测并恢复 SSH 断线；托盘退出会取消等待并停止监测。验证不会调用 write/edit/bash/python 或 Studio 变更工具。
 
 直接使用旧源码入口 `python -m kt_mcp_client` 时，默认独立配置根为（便携版启动入口改用项目内 `data/`）：
 
